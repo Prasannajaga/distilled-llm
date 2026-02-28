@@ -9,7 +9,8 @@ from torch.utils.data import DataLoader
 
 from utils.common import get_device
 from utils.config import TrainingConfig
-from Cdatasets.dataset import PretrainDataset, pretrain_collate_fn
+from Cdatasets.dataset import pretrain_collate_fn
+from utils.binary_dataset import TokenizedBinaryDataset
 from scripts.model import GQATransformer
 from Cdatasets.tokenizer import load_tokenizer
 from utils.trainer import Trainer
@@ -20,6 +21,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 1: Pre-training")
 
     p.add_argument("--dataset_path", type=str, required=True)
+    p.add_argument("--bin_path", type=str, default="./data/pretrain_tokens.bin")
+    p.add_argument("--max_rows", type=int, default=None)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--teacher", action="store_true", default=False)
 
@@ -108,11 +111,14 @@ def main() -> None:
         if step > 0:
             trainer.global_step = step
 
-    dataset = PretrainDataset(
-        data_dir=args.dataset_path,
+    dataset = TokenizedBinaryDataset(
+        source=args.dataset_path,
         tokenizer=tokenizer,
         block_size=config.block_size,
+        bin_path=args.bin_path,
+        max_rows=args.max_rows,
     )
+    
     collate = partial(pretrain_collate_fn, pad_id=tokenizer.pad_token_id)
     dataloader = DataLoader(
         dataset,
