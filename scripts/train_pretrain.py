@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import argparse
-from functools import partial
 from pathlib import Path
 from typing import Final
 
-from torch.utils.data import DataLoader
-
 from utils.common import get_device
 from utils.config import TrainingConfig
-from Cdatasets.dataset import pretrain_collate_fn
-from utils.binary_dataset import TokenizedBinaryDataset
+from utils.packed_dataset_builder import PackedDatasetBuilder
 from scripts.model import GQATransformer
 from Cdatasets.tokenizer import load_tokenizer
 from utils.trainer import Trainer
@@ -19,8 +15,7 @@ TINYLLAMA_MODEL_NAME: Final[str] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Phase 1: Pre-training")
-
-    p.add_argument("--dataset_path", type=str, required=True)
+ 
     p.add_argument("--bin_path", type=str, default="./data/pretrain_tokens.bin")
     p.add_argument("--max_rows", type=int, default=None)
     p.add_argument("--epochs", type=int, default=1)
@@ -57,6 +52,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt_interval_steps", type=int)
 
     p.add_argument("--log_interval_steps", type=int)
+    p.add_argument("--val_ratio", type=float, default=0.0)
 
     return p.parse_args()
 
@@ -111,30 +107,32 @@ def main() -> None:
         if step > 0:
             trainer.global_step = step
 
-    dataset = TokenizedBinaryDataset(
-        source=args.dataset_path,
-        tokenizer=tokenizer,
-        block_size=config.block_size,
+    train_dataloader, val_dataloader = PackedDatasetBuilder.to_dataloader(
         bin_path=args.bin_path,
-        max_rows=args.max_rows,
-    )
-    
-    collate = partial(pretrain_collate_fn, pad_id=tokenizer.pad_token_id)
-    dataloader = DataLoader(
-        dataset,
+        block_size=config.block_size,
         batch_size=config.train_batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        collate_fn=collate,
         drop_last=True,
+        pin_memory=True,
+        max_samples=args.max_rows,
+        val_ratio=args.val_ratio,
+        val_batch_size=config.eval_batch_size,
+        split_seed=config.seed if config.seed is not None else 42,
     )
-
-    trainer.log_dataset_info(dataset, dataloader, config)
+    train_samples = len(train_dataloader.dataset)
+    val_samples = len(val_dataloader.dataset) if val_dataloader is not None else 0
+    total_samples = train_samples + val_samples
+    print(
+        f"[DATA] Total samples: {total_samples:,} | "
+        f"Train: {train_samples:,} | Val: {val_samples:,}"
+    )
     
     print(f"[TRAIN] Starting {role} pre-training from step {trainer.global_step}")
 
     trainer.train(
-        train_dataloader=dataloader,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
         epochs=args.epochs,
         max_steps=config.total_steps
     )

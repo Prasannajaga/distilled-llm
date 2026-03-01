@@ -271,13 +271,22 @@ class Trainer:
         if isinstance(batch, (list, tuple)):
             batch_tensor = batch[0]
         elif isinstance(batch, dict):
-            batch_tensor = batch.get("input_ids") or batch.get("inputs") or batch.get("input")
+            batch_tensor = self._get_first_present(
+                batch, ["input_ids", "inputs", "input"]
+            )
         else:
             batch_tensor = batch
         if batch_tensor is not None and hasattr(batch_tensor, 'size'):
             batch_size = batch_tensor.size(0)
             seq_length = batch_tensor.size(1) if batch_tensor.dim() > 1 else self.config.block_size
             self._total_tokens_trained += batch_size * seq_length
+
+    @staticmethod
+    def _get_first_present(batch: dict, keys: list[str]):
+        for key in keys:
+            if key in batch and batch[key] is not None:
+                return batch[key]
+        return None
 
     def _build_progress_postfix(
         self,
@@ -298,6 +307,30 @@ class Trainer:
             mem = self.get_memory_summary()
             postfix["mem"] = f"{mem['allocated_gb']:.1f}GB"
         return postfix
+
+    def _should_log_step(self, step: int) -> bool:
+        if not self.config.enable_logging:
+            return False
+        interval = int(getattr(self.config, "log_interval_steps", 0) or 0)
+        return interval > 0 and step > 0 and step % interval == 0
+
+    def _build_step_log_message(
+        self,
+        step: int,
+        train_loss: float,
+        lr: float,
+        grad_norm: Optional[float],
+        val_loss: Optional[float],
+        iter_time_s: Optional[float],
+    ) -> str:
+        message = f"[Trainer] Step {step}: train_loss={train_loss:.4f} | lr={lr:.2e}"
+        if grad_norm is not None:
+            message += f" | gnorm={grad_norm:.2f}"
+        if val_loss is not None:
+            message += f" | val_loss={val_loss:.4f}"
+        if iter_time_s is not None:
+            message += f" | iter_time_ms={iter_time_s * 1000.0:.1f}"
+        return message
 
     def _generate_training_metadata(self, checkpoint_path: str) -> Dict[str, Any]:
         params = self.parameter_counts()
@@ -484,8 +517,8 @@ class Trainer:
                 return batch[0], batch[0]
             return batch[0], batch[1]
         if isinstance(batch, dict):
-            inp = batch.get("input_ids") or batch.get("inputs") or batch.get("input")
-            tgt = batch.get("labels") or batch.get("targets") or batch.get("targets_ids")
+            inp = self._get_first_present(batch, ["input_ids", "inputs", "input"])
+            tgt = self._get_first_present(batch, ["labels", "targets", "targets_ids"])
             if inp is None:
                 raise ValueError("Dict batch missing input_ids/inputs key")
             if tgt is None:
@@ -636,6 +669,10 @@ class Trainer:
                     self._track_step_metadata(step_info["loss"], batch)
 
                     if step_info["did_step"]:
+                        now = time.perf_counter()
+                        iter_time_s = now - self._last_step_time if self._last_step_time else None
+                        self._last_step_time = now
+
                         avg_loss = running_loss / loss_count
 
                         postfix = self._build_progress_postfix(
@@ -646,6 +683,22 @@ class Trainer:
                         )
                         pbar.set_postfix(postfix)
                         pbar.update(1)
+
+                        if self._should_log_step(self.global_step):
+                            if self.config.log_per_iteration_time:
+                                step_time = iter_time_s
+                            else:
+                                step_time = None
+                            self._log(
+                                self._build_step_log_message(
+                                    step=self.global_step,
+                                    train_loss=avg_loss,
+                                    lr=step_info["lr"],
+                                    grad_norm=step_info["grad_norm"],
+                                    val_loss=last_val_loss,
+                                    iter_time_s=step_time,
+                                )
+                            )
                         
                         # Reset running loss periodically
                         if self.global_step % 100 == 0:
