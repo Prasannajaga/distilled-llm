@@ -5,7 +5,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
@@ -152,71 +152,53 @@ def build_model(config: TrainingConfig, vocab_size: int) -> GQATransformer:
 
 
 def prepare_input_ids(tokenizer: Any, prompt: str, device: torch.device) -> torch.Tensor:
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        model_inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        )
-        if isinstance(model_inputs, dict):
-            input_ids = model_inputs["input_ids"]
-        else:
-            input_ids = model_inputs
-    except Exception:
-        encoded = tokenizer(prompt, return_tensors="pt")
-        input_ids = encoded["input_ids"]
-
-    if isinstance(input_ids, str):
-        input_ids = tokenizer(input_ids, return_tensors="pt")["input_ids"]
-    elif not isinstance(input_ids, torch.Tensor):
-        try:
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
-        except (TypeError, ValueError):
-            input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"]
+    input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    if not isinstance(input_ids, torch.Tensor):
+        input_ids = torch.tensor([input_ids], dtype=torch.long)
     if input_ids.dim() == 1:
         input_ids = input_ids.unsqueeze(0)
-
     return input_ids.to(device)
 
 
-def make_human_readable(text: str) -> str:
+def format_latex(text: str) -> str:
     out = text
+    out = re.sub(r"\\begin\{[^}]+\}", "", out)
+    out = re.sub(r"\\end\{[^}]+\}", "", out)
+    out = re.sub(r"\\label\{[^}]+\}", "", out)
+    out = re.sub(r"\\(?:frac|sqrt)\{([^}]*)\}\{([^}]*)\}", r"(\1/\2)", out)
+    out = re.sub(r"\\(?:text|mathrm|mathbf|mathit|mathbb|operatorname)\{([^}]*)\}", r"\1", out)
+    out = re.sub(r"\\(?:left|right|Big|big|bigg|Bigg)", "", out)
+    out = re.sub(r"\\(alpha|beta|gamma|delta|epsilon|theta|lambda|mu|sigma|pi|phi|psi|omega)", r"\1", out)
+    out = re.sub(r"\\(sin|cos|tan|log|ln|exp|min|max|lim|inf|sup|sum|prod|int)", r"\1", out)
+    out = re.sub(r"\\(leq|geq|neq|approx|equiv|sim)", lambda m: {"leq": "<=", "geq": ">=", "neq": "!=", "approx": "≈", "equiv": "≡", "sim": "~"}.get(m.group(1), m.group(0)), out)
+    out = re.sub(r"\\(cdot|times|div)", lambda m: {"cdot": "·", "times": "×", "div": "÷"}.get(m.group(1), m.group(0)), out)
+    out = re.sub(r"\\(in|notin|subset|supset|cup|cap)", lambda m: {"in": "∈", "notin": "∉", "subset": "⊂", "supset": "⊃", "cup": "∪", "cap": "∩"}.get(m.group(1), m.group(0)), out)
+    out = re.sub(r"\\(rightarrow|leftarrow|Rightarrow|Leftarrow|infty)", lambda m: {"rightarrow": "→", "leftarrow": "←", "Rightarrow": "⇒", "Leftarrow": "⇐", "infty": "∞"}.get(m.group(1), m.group(0)), out)
+    out = re.sub(r"\\[a-zA-Z]+\*?", " ", out)
+    out = re.sub(r"\$+", "", out)
+    out = re.sub(r"([^^])\^\{([^}]*)\}", r"\1^(\2)", out)
+    out = re.sub(r"_\{([^}]*)\}", r"_\1", out)
+    out = re.sub(r"[{}]", "", out)
+    out = re.sub(r"&", " ", out)
+    out = re.sub(r"\\{2,}", "\n", out)
+    out = re.sub(r"\\\s", " ", out)
+    out = re.sub(r"[ \t]+", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
 
-    try:
-        from pylatexenc.latex2text import LatexNodes2Text
 
-        out = LatexNodes2Text().latex_to_text(out)
-    except Exception:
-        # Fallback for common LaTeX markers when pylatexenc is unavailable.
-        out = re.sub(r"\\begin\{[^}]+\}", " ", out)
-        out = re.sub(r"\\end\{[^}]+\}", " ", out)
-        out = re.sub(r"\\[a-zA-Z]+\*?", " ", out)
-
-    out = re.sub(r"\$+", " ", out)
-    out = re.sub(r"[_^{}]", " ", out)
-    out = re.sub(r"\\+", " ", out)
-    out = re.sub(r"\s+", " ", out).strip()
-
-    try:
-        from ftfy import fix_text
-
-        out = fix_text(out)
-    except Exception:
-        pass
-
-    return out
-
-
-def run_prompt(
-    engine: InferenceEngine,
-    tokenizer: Any,
-    prompt: str,
-) -> str:
-    input_ids = prepare_input_ids(tokenizer, prompt, engine.device)
-    completion = "".join(list(engine.stream_generate(input_ids)))
-    return make_human_readable(completion)
+def stream_to_stdout(token_stream: Iterator[str]) -> str:
+    chunks: list[str] = []
+    for chunk in token_stream:
+        print(chunk, end="", flush=True)
+        chunks.append(chunk)
+    print()
+    raw = "".join(chunks)
+    cleaned = format_latex(raw)
+    if cleaned != raw:
+        print("\n--- Formatted ---")
+        print(cleaned)
+    return cleaned
 
 
 def interactive_loop(
@@ -237,9 +219,9 @@ def interactive_loop(
             print("Exiting.")
             break
 
+        input_ids = prepare_input_ids(tokenizer, prompt, engine.device)
         print("assistant> ", end="", flush=True)
-        completion = run_prompt(engine, tokenizer, prompt)
-        print(completion)
+        stream_to_stdout(engine.stream_generate(input_ids))
 
 
 def main() -> None:
@@ -272,8 +254,8 @@ def main() -> None:
     print(f"[DEVICE] {device}")
     if args.prompt:
         prompt = " ".join(args.prompt)
-        completion = run_prompt(engine, tokenizer, prompt)
-        print(completion)
+        input_ids = prepare_input_ids(tokenizer, prompt, device)
+        stream_to_stdout(engine.stream_generate(input_ids))
         return
 
     interactive_loop(engine, tokenizer)

@@ -81,6 +81,8 @@ class InferenceEngine:
         input_ids: (1, T) already tokenized
         """
         idx = input_ids.to(self.device)
+        generated_ids: list[int] = []
+        prev_text = ""
 
         for _ in range(self.cfg.max_new_tokens):
             idx_cond = idx[:, -self.cfg.block_size :]
@@ -95,7 +97,6 @@ class InferenceEngine:
             next_token_logits = logits[:, -1, :]
             next_token = self._sample_next_token(next_token_logits, idx)
 
-            # no need to genreate if it's end of token 
             if (
                 self.cfg.stop_on_eos
                 and next_token.item() == self.tokenizer.eos_token_id
@@ -103,10 +104,14 @@ class InferenceEngine:
                 break
 
             idx = torch.cat([idx, next_token], dim=1)
+            generated_ids.append(next_token.item())
 
-            yield self.tokenizer.decode(
-                next_token[0], skip_special_tokens=True
-            )
+            full_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            new_text = full_text[len(prev_text):]
+            prev_text = full_text
+
+            if new_text:
+                yield new_text
 
     # Non-streaming generation
     @torch.no_grad()
