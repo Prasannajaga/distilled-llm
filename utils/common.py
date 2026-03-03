@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import json
 import math
 import os
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+from utils.config_io import save_config_json
 
 
 def get_device(requested: str) -> torch.device:
@@ -59,9 +58,12 @@ def save_checkpoint(
 
     config_path = prefix_dir / "config.json"
     if not config_path.exists():
-        config_data = asdict(config)
-        with open(config_path, "w") as f:
-            json.dump(config_data, f, indent=2)
+        save_config_json(
+            config_path=str(config_path),
+            training_cfg=config,
+            tokenizer=tokenizer,
+            model=model,
+        )
         print(f"[CHECKPOINT] Saved config: {config_path}")
 
     fname = f"{prefix}_{step}.pt"
@@ -101,6 +103,7 @@ def load_checkpoint(
     device: torch.device,
     prefix: str = "ckpt",
 ) -> tuple[int, int]:
+    
     """Load the latest checkpoint from a prefix subdirectory.
 
     Scans checkpoint_dir/prefix/ for files matching prefix_{step}.pt and loads
@@ -125,3 +128,64 @@ def load_checkpoint(
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     step = checkpoint.get("training_step", checkpoint.get("step", 0))
     return step, 0
+
+@torch.no_grad()
+def analyze_model(model: nn.Module, cName: str) -> None:
+    model.eval()
+    total_params = 0
+    categories = {
+        "Embedding": 0,
+        "Attention (Q, K, V, Out)": 0,
+        "FFN (Feed-Forward)": 0,
+        "Normalization": 0,
+        "LM Head": 0,
+        "Other": 0
+    }
+    
+    # Track visited parameter IDs to properly account for tied weights (e.g., token_emb and lm_head)
+    visited_params = set()
+    
+    for name, param in model.named_parameters():
+        if id(param) in visited_params:
+            continue
+        
+        visited_params.add(id(param))
+        num_params = param.numel()
+        total_params += num_params
+        
+        name_lower = name.lower()
+        if "token_emb" in name_lower or "embed" in name_lower:
+            # If lm_head shares weights with token_emb but named lm_head
+            if "lm_head" in name_lower:
+                categories["LM Head"] += num_params
+            else:
+                categories["Embedding"] += num_params
+        elif "attn" in name_lower or "q_proj" in name_lower or "k_proj" in name_lower or "v_proj" in name_lower or "out_proj" in name_lower:
+            categories["Attention (Q, K, V, Out)"] += num_params
+        elif "ffn" in name_lower or "mlp" in name_lower:
+            categories["FFN (Feed-Forward)"] += num_params
+        elif "norm" in name_lower:
+            categories["Normalization"] += num_params
+        elif "lm_head" in name_lower:
+            categories["LM Head"] += num_params
+        else:
+            categories["Other"] += num_params
+
+    if total_params == 0:
+        print("Model has 0 parameters.")
+        return
+
+    print("\n" + "="*55)
+    print(f"{'MODEL PARAMETER DISTRIBUTION':^55}")
+    print("="*55)
+    print(f" {cName} Parameters: {total_params / 1e6:.2f} M")
+    print("-" * 55)
+    
+    sorted_cats = sorted(categories.items(), key=lambda item: item[1], reverse=True)
+    for cat_name, param_count in sorted_cats:
+        if param_count > 0:
+            percentage = (param_count / total_params) * 100
+            # Pretty print with alignment
+            print(f"{cat_name:<25} | {param_count / 1e6:>8.2f} M | {percentage:>6.2f}%")
+            
+    print("="*55 + "\n")

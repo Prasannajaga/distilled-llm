@@ -136,6 +136,8 @@ def main() -> None:
         epochs=args.epochs,
         max_steps=config.total_steps
     )
+    if trainer.ckpt_dir:
+        trainer.save_final_checkpoint(step=trainer.global_step)
 
     print(f"[DONE] {role} pre-training complete.")
 
