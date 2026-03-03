@@ -1,30 +1,31 @@
+# Purpose
 
-this model is developed soley for understand indepth knowledge of the distillation teacher & student model
+I developed this model solely to understand the in-depth knowledge of how distillation works between a teacher and student model.
 
-what is scope of this training form scrath ?
+# Scope
 
-after training the autoregressive model on tiny-stories dataset
-I have always wondered where next
+What is the scope of training this from scrath?
 
-maths reasoning model trained part of math-ai/AutoMathText
-subset used
+After training an autoregressive model on the tiny-stories dataset, I always wondered "where to go next".
+So I decided on a maths reasoning model trained on a part of the `math-ai/AutoMathText` dataset.
+I specifically used these subsets:
 
 1. 0.70-to-1.00
 2. 0.60-to-1.00
 
-I alaways struggle d to find the dataset when training model
-so here I choosed this theese two subset alone cost me 10GB in size
+I alaways struggled to find a good dataset when training a model. So here I choosed these two subsets which alone cost me 10GB in size.
 
-my key learnings:
+# My Key Learnings
 
-while I always played with samll datasets with less in size
-I never came to know how exensize the tokenization of the huge corpus data gets and complex grows linearly
+## Data Processing
 
-while training my model couple of times I came to know that this process tooks more than training my model
+While I always played with samll datasets with less size, I never realized how extensive tokenization on a huge corpus gets—and the complexity grows linearly.
 
-after upon some search and I
-later found that process which worked for me for handle this huge daata
+While training my model a couple of times, I came to know that the data processing took more time than actually training the model!
 
+After some searching, I later found a process that worked well for me to handle this huge daata:
+
+```text
 HF dataset
     ↓
 Tokenize
@@ -40,6 +41,22 @@ Torch Dataset
 DataLoader
     ↓
 Model
+```
 
-this reduced huge time for me honestly speaking.
-it took me sometime but it worth it
+This reduced huge amounts of time for me honestly speaking. It took me sometime to set up, but it was completley worth it.
+
+## Dataset Sampling
+
+I implemented fixed dataset sampling.
+
+There's no need to stick to just one dataset when pre-training. You can take a mixture of datasets and tokenize them together, which helps the model perform well in generallly.
+
+## Checkpointing
+
+I learned that saving the optimizer & scaler is necessary when you want to resume training from a checkpoint save, but you don't need them for the final checkpoint save.
+
+But you can still store them if u don't care about size, and later split the `state_dict` alone and save it separately.
+
+## Scaling Laws
+
+I learned that you have to train on roughly `20 * params` tokens to get the best out of it, according to the chinchila paper's scaling laws.

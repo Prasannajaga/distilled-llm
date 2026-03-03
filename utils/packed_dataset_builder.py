@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import DataLoader, Dataset
 
 HEADER_MAGIC = b"TBIN"
 HEADER_VERSION = 1
@@ -79,6 +79,12 @@ class PackedDatasetBuilder:
         self._tokenize_and_save(raw_dataset)
         return self
 
+    def build_from_hf_dataset(self, dataset: Any) -> PackedDatasetBuilder:
+        """Build packed tokens from an already loaded Hugging Face dataset object."""
+        self.packed = None
+        self._tokenize_and_save(dataset)
+        return self
+
     @staticmethod
     def to_dataloader(
         bin_path: str | Path,
@@ -93,18 +99,17 @@ class PackedDatasetBuilder:
         val_batch_size: Optional[int] = None,
         split_seed: int = 42,
     ) -> tuple[DataLoader, Optional[DataLoader]]:
-        import struct
-        bin_path = Path(bin_path)
-        if not bin_path.exists():
-            raise FileNotFoundError(f"Binary file not found: {bin_path}")
+        resolved_bin_path = Path(bin_path)
+        if resolved_bin_path.is_dir():
+            resolved_bin_path = resolved_bin_path / "data.bin"
+        if not resolved_bin_path.exists():
+            raise FileNotFoundError(f"Binary file not found: {resolved_bin_path}")
 
-        # Check for TBIN header from TokenizedBinaryDataset for backwards compatibility
         offset = 0
         dt = np.dtype(np.uint32)
-        with open(bin_path, "rb") as f:
+        with open(resolved_bin_path, "rb") as f:
             magic = f.read(4)
             if magic == b"TBIN":
-                f.seek(4)  # Skip magic
                 _version = struct.unpack("<I", f.read(4))[0]
                 stored_block_size = struct.unpack("<I", f.read(4))[0]
                 dtype_code = struct.unpack("<I", f.read(4))[0]
@@ -112,20 +117,56 @@ class PackedDatasetBuilder:
                 dt = np.dtype(np.uint16) if dtype_code == 2 else np.dtype(np.uint32)
                 if stored_block_size != block_size:
                     raise ValueError(
-                        f"Block size mismatch for TBIN file {bin_path}: "
+                        f"Block size mismatch for TBIN file {resolved_bin_path}: "
                         f"file block_size={stored_block_size}, requested={block_size}. "
                         "Pass the same block_size used while creating the binary."
                     )
 
-        print(f"[LOAD] Memory-mapping packed binary: {bin_path} (dtype={dt}, offset={offset})")
-        packed_data = np.memmap(str(bin_path), dtype=dt, mode="r", offset=offset)
-        n_sequences = len(packed_data) // block_size
+        file_size = resolved_bin_path.stat().st_size
+        if file_size < offset:
+            raise ValueError(f"Invalid binary file {resolved_bin_path}: file smaller than header offset.")
+
+        data_bytes = file_size - offset
+        if data_bytes % dt.itemsize != 0:
+            raise ValueError(
+                f"Corrupt token file {resolved_bin_path}: payload bytes ({data_bytes}) are not aligned "
+                f"to dtype size ({dt.itemsize})."
+            )
+
+        n_tokens = data_bytes // dt.itemsize
+        n_sequences = n_tokens // block_size
+        dropped_tokens = n_tokens - (n_sequences * block_size)
+        if dropped_tokens > 0:
+            print(
+                f"[LOAD] Warning: dropping {dropped_tokens:,} trailing tokens from {resolved_bin_path} "
+                "to preserve full blocks."
+            )
 
         if max_samples is not None and max_samples < n_sequences:
-            n_sequences = max_samples
+            n_sequences = int(max_samples)
+        if n_sequences <= 0:
+            raise ValueError(
+                f"No sequences found in {resolved_bin_path}. "
+                "Check data generation or lower block_size."
+            )
 
-        packed_data = packed_data[: n_sequences * block_size].reshape(n_sequences, block_size)
-        print(f"[LOAD] Loaded {n_sequences:,} sequences of length {block_size}")
+        tokens_to_map = n_sequences * block_size
+        print(
+            f"[LOAD] Memory-mapping packed binary: {resolved_bin_path} "
+            f"(dtype={dt}, offset={offset}, sequences={n_sequences:,})"
+        )
+        packed_data = np.memmap(
+            str(resolved_bin_path),
+            dtype=dt,
+            mode="r",
+            offset=offset,
+            shape=(tokens_to_map,),
+        ).reshape(n_sequences, block_size)
+
+        if val_ratio < 0.0 or val_ratio >= 1.0:
+            raise ValueError(
+                f"val_ratio must be in [0.0, 1.0). Got {val_ratio}."
+            )
 
         class LoadedPackedDataset(Dataset):
             def __init__(self, data: np.ndarray):
@@ -137,15 +178,10 @@ class PackedDatasetBuilder:
             def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
                 if idx < 0 or idx >= len(self.data):
                     raise IndexError(f"Index {idx} out of bounds for dataset of size {len(self.data)}")
-                row = self.data[idx].astype(np.int64)
+                row = self.data[idx].astype(np.int64, copy=False)
                 input_ids = torch.from_numpy(row[:-1].copy())
                 targets = torch.from_numpy(row[1:].copy())
                 return {"input_ids": input_ids, "targets": targets}
-
-        if val_ratio < 0.0 or val_ratio >= 1.0:
-            raise ValueError(
-                f"val_ratio must be in [0.0, 1.0). Got {val_ratio}."
-            )
 
         dataset = LoadedPackedDataset(packed_data)
         val_loader: Optional[DataLoader] = None
@@ -166,7 +202,7 @@ class PackedDatasetBuilder:
             else:
                 train_size = len(dataset) - val_size
                 generator = torch.Generator().manual_seed(int(split_seed))
-                train_dataset, val_dataset = random_split(
+                train_dataset, val_dataset = torch.utils.data.random_split(
                     dataset,
                     [train_size, val_size],
                     generator=generator,

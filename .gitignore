@@ -12,3 +12,8 @@ output/
 dist/
 data/
 test.py
+presets/
+*.bin
+*.idx
+test.py
+test.py
