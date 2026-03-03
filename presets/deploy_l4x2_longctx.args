@@ -1,0 +1,59 @@
+# Required project args
+--project_id YOUR_PROJECT_ID
+--region us-central1
+--bucket_uri gs://YOUR_BUCKET
+
+# Job metadata
+--display_name distilled-llm-l4x2-longctx
+--base_output_dir gs://YOUR_BUCKET/training_logs/longctx
+--staging_bucket gs://YOUR_BUCKET
+
+# Machine config
+--machine_type g2-standard-24
+--accelerator_type NVIDIA_L4
+--accelerator_count 2
+--replica_count 1
+--train_image us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest
+
+# Launcher
+--train_module scripts.run_step_train
+--nproc_per_node 2
+--local_ckpt_dir /outputs/mini-code-v1
+--train_log_level INFO
+--train_progress_bar 0
+
+# Dataset packing
+--data_bin_dir /tmp/vertex-bins
+--data_bin_name data.bin
+--block_size 2048
+--datasets_json /home/prasanna/coding/distilled-llm/data/dataset_mixture.json
+--data_num_workers 12
+--data_pack_batch_size 512
+--tokenizer_model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+
+# Training/model
+--train_device cuda
+--train_seed 42
+--train_num_workers 8
+--n_layer 16
+--n_embd 1024
+--n_head 16
+--train_batch_size 2
+--eval_batch_size 1
+--grad_accum_steps 16
+--validation_batch_count 10
+--val_ratio 0.1
+--optimizer adamw
+--lr 1e-4
+--eps 1e-8
+--weight_decay 0.1
+--grad_clip_norm 1.0
+--use_amp 1
+--amp_dtype bfloat16
+--enable_gradient_checkpointing 1
+--total_steps 8000
+--warmup_steps 800
+--ckpt_interval_steps 400
+--save_optimizer_state 0
+--log_interval_steps 50
+--async_run
