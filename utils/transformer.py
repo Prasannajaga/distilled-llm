@@ -208,9 +208,17 @@ class KVCache(nn.Module):
 class SWIGLU_FFN(nn.Module):
     """SwiGLU Feed-Forward Network (used in LLaMA-style models)"""
 
-    def __init__(self, n_embd: int, expansion_ratio: float = 4.0, dropout: float = 0.0):
+    def __init__(
+        self,
+        n_embd: int,
+        expansion_ratio: float = 4.0,
+        dropout: float = 0.0,
+        multiple_of: int = 128,
+    ):
         super().__init__()
         hidden_dim = int(expansion_ratio * n_embd)
+        if multiple_of > 1:
+            hidden_dim = ((hidden_dim + multiple_of - 1) // multiple_of) * multiple_of
 
         self.w1 = nn.Linear(n_embd, hidden_dim)
         self.w2 = nn.Linear(n_embd, hidden_dim)
@@ -219,9 +227,10 @@ class SWIGLU_FFN(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.dropout(
-            self.w3(F.silu(self.w1(x)) * self.w2(x))
-        )
+        gate = self.w1(x)
+        up = self.w2(x)
+        gate = F.silu(gate, inplace=True)
+        return self.dropout(self.w3(gate * up))
 
 class RMSNorm(nn.Module):
 

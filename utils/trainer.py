@@ -11,14 +11,18 @@ import math
 import sys
 import json
 import tempfile
+import traceback
+from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
 from typing import Optional, Any, Dict 
 import torch
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from tqdm import tqdm
 from utils.config import TrainingConfig
+from utils.config_io import save_config_json
 
 SUPPORTED_OPTIMIZERS = frozenset({"adamw", "adam", "sgd", "adafactor"})
 
@@ -38,23 +42,27 @@ class Trainer:
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.tokenizer = tokenizer
         self.prompts = list(prompts or [])
+        self.show_progress_bar = os.environ.get("TRAIN_PROGRESS_BAR", "0") == "1"
         # checkpoint directory precedence: explicit arg > config.ckpt_dir
         self.ckpt_dir = ckpt_dir or config.ckpt_dir
         self.logs_dir: Optional[str] = None
         self.metrics_dir: Optional[str] = None
         self.log_file_path: Optional[str] = None
+        self.step_metrics_path: Optional[str] = None
         if self.ckpt_dir:
             os.makedirs(self.ckpt_dir, exist_ok=True)
             self.logs_dir = os.path.join(self.ckpt_dir, "logs")
             os.makedirs(self.logs_dir, exist_ok=True)
             timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
             self.log_file_path = os.path.join(self.logs_dir, f"trainer_{timestamp}.log")
+            self.step_metrics_path = os.path.join(self.logs_dir, f"trainer_steps_{timestamp}.jsonl")
             if len(self.prompts) > 0:
                 self.metrics_dir = os.path.join(self.ckpt_dir, "metrics")
                 os.makedirs(self.metrics_dir, exist_ok=True)
 
         # device placement
         self.model.to(self.device)
+        self._setup_gradient_checkpointing()
 
         # AMP setup: disable on CPU automatically
         self.use_amp = bool(self.config.use_amp and self.device.type == "cuda")
@@ -110,13 +118,17 @@ class Trainer:
 
     def _log(self, message: str):
         if self.config.enable_logging:
-            tqdm.write(message, file=sys.stderr)
+            tqdm.write(message, file=sys.stdout)
             if self.log_file_path:
                 try:
                     with open(self.log_file_path, "a", encoding="utf-8") as fp:
                         fp.write(f"{datetime.now().isoformat()} | {message}\n")
                 except Exception:
                     pass
+
+    def _log_exception(self, prefix: str):
+        self._log(prefix)
+        self._log(traceback.format_exc().rstrip())
     
     def _log_init_info(self):
         params = self.parameter_counts()
@@ -125,6 +137,19 @@ class Trainer:
         if self.device.type == "cuda":
             mem = self.get_memory_summary()
             self._log(f"[Trainer] GPU Memory: {mem['allocated_gb']:.2f}GB allocated | Device: {self.device}")
+
+    def _is_distributed(self) -> bool:
+        import torch.distributed as dist
+        return dist.is_available() and dist.is_initialized()
+
+    def _is_main_process(self) -> bool:
+        if not self._is_distributed():
+            return True
+        import torch.distributed as dist
+        return dist.get_rank() == 0
+
+    def _unwrap_model(self) -> nn.Module:
+        return self.model.module if isinstance(self.model, DDP) else self.model
 
     def _resolve_amp_dtype(self) -> torch.dtype:
         dtype_map = {
@@ -323,14 +348,44 @@ class Trainer:
         val_loss: Optional[float],
         iter_time_s: Optional[float],
     ) -> str:
-        message = f"[Trainer] Step {step}: train_loss={train_loss:.4f} | lr={lr:.2e}"
-        if grad_norm is not None:
-            message += f" | gnorm={grad_norm:.2f}"
-        if val_loss is not None:
-            message += f" | val_loss={val_loss:.4f}"
-        if iter_time_s is not None:
-            message += f" | iter_time_ms={iter_time_s * 1000.0:.1f}"
-        return message
+        gnorm_str = f"{grad_norm:>6.2f}" if grad_norm is not None else "   n/a"
+        val_str = f"{val_loss:>8.4f}" if val_loss is not None else "     n/a"
+        iter_ms_str = f"{iter_time_s * 1000.0:>7.1f}" if iter_time_s is not None else "    n/a"
+        return (
+            f"[Trainer] step={step:>7d} | "
+            f"train_loss={train_loss:>8.4f} | "
+            f"val_loss={val_str} | "
+            f"lr={lr:>9.2e} | "
+            f"gnorm={gnorm_str} | "
+            f"iter_ms={iter_ms_str}"
+        )
+
+    def _log_step_metrics(
+        self,
+        *,
+        step: int,
+        train_loss: float,
+        lr: float,
+        grad_norm: Optional[float],
+        val_loss: Optional[float],
+        iter_time_s: Optional[float],
+    ) -> None:
+        if not self.step_metrics_path:
+            return
+        payload = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "step": int(step),
+            "train_loss": float(train_loss),
+            "val_loss": float(val_loss) if val_loss is not None else None,
+            "lr": float(lr),
+            "grad_norm": float(grad_norm) if grad_norm is not None else None,
+            "iter_time_ms": (float(iter_time_s) * 1000.0) if iter_time_s is not None else None,
+        }
+        try:
+            with open(self.step_metrics_path, "a", encoding="utf-8") as fp:
+                fp.write(json.dumps(payload) + "\n")
+        except Exception:
+            pass
 
     def _generate_training_metadata(self, checkpoint_path: str) -> Dict[str, Any]:
         params = self.parameter_counts()
@@ -341,7 +396,7 @@ class Trainer:
 
         return {
             "model": {
-                "name": self.model.__class__.__name__,
+                "name": self._unwrap_model().__class__.__name__,
                 "checkpoint_path": checkpoint_path,
                 "timestamp": datetime.now().isoformat(),
                 "total_params": params["total_params"],
@@ -380,13 +435,14 @@ class Trainer:
         }
 
     def _save_metadata_atomically(self, metadata: Dict[str, Any], path: str):
-        dir_path = os.path.dirname(path)
+        target_path = os.path.abspath(path)
+        dir_path = os.path.dirname(target_path)
         os.makedirs(dir_path, exist_ok=True)
-        fd, temp_path = tempfile.mkstemp(suffix='.json', dir=dir_path)
+        fd, temp_path = tempfile.mkstemp(suffix=".json", dir=dir_path)
         try:
-            with os.fdopen(fd, 'w') as f:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2)
-            os.replace(temp_path, path)
+            os.replace(temp_path, target_path)
         except Exception:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
@@ -401,10 +457,119 @@ class Trainer:
             metadata = self._generate_training_metadata(checkpoint_path)
             self._save_metadata_atomically(metadata, metadata_path)
             self._log(f"[Trainer] Saved metadata: {metadata_path}")
-        except Exception as e:
-            self._log(f"[Trainer] Warning: Failed to save metadata: {e}")
+        except Exception:
+            self._log_exception("[Trainer] Warning: Failed to save metadata")
+
+    @staticmethod
+    def _clean_metric(value: Optional[float], *, invalid: float) -> Optional[float]:
+        if value is None:
+            return None
+        if value == invalid:
+            return None
+        return float(value)
+
+    def _get_world_size(self) -> int:
+        try:
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                return int(dist.get_world_size())
+        except Exception:
+            pass
+        return 1
+
+    def build_results_payload(self, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        params = self.parameter_counts()
+        mem = self.get_memory_summary()
+        world_size = self._get_world_size()
+        total_tokens_local = int(self._total_tokens_trained)
+        total_tokens_global = int(total_tokens_local * world_size)
+        train_time_s = float(self._total_training_time or 0.0)
+        tokens_per_second = (total_tokens_global / train_time_s) if train_time_s > 0 else 0.0
+
+        payload: Dict[str, Any] = {
+            "schema_version": 1,
+            "created_at_utc": datetime.utcnow().isoformat() + "Z",
+            "run": {
+                "global_step": int(self.global_step),
+                "target_total_steps": int(self.total_steps) if self.total_steps is not None else None,
+                "world_size": int(world_size),
+                "tokens_trained_local": total_tokens_local,
+                "tokens_trained_global_estimate": total_tokens_global,
+                "train_time_seconds": round(train_time_s, 3),
+                "tokens_per_second_global_estimate": round(tokens_per_second, 3),
+            },
+            "loss": {
+                "best_train_loss": self._clean_metric(self._best_train_loss, invalid=float("inf")),
+                "best_train_loss_step": int(self._best_train_loss_step),
+                "worst_train_loss": self._clean_metric(self._worst_train_loss, invalid=float("-inf")),
+                "final_train_loss": self._clean_metric(self._final_train_loss, invalid=float("inf")),
+                "best_val_loss": self._clean_metric(self._best_val_loss, invalid=float("inf")),
+                "best_val_loss_step": int(self._best_val_loss_step),
+                "final_val_loss": self._clean_metric(self._final_val_loss, invalid=float("inf")),
+            },
+            "model": {
+                "name": self._unwrap_model().__class__.__name__,
+                "n_layer": int(self.config.n_layer),
+                "n_embd": int(self.config.n_embd),
+                "n_head": int(self.config.n_head),
+                "block_size": int(self.config.block_size),
+                "total_params": int(params["total_params"]),
+                "trainable_params": int(params["trainable_params"]),
+                "trainable_percent": float(params["trainable_percent"]),
+            },
+            "optimization": {
+                "optimizer": str(getattr(self.config, "optimizer", "adamw")),
+                "lr": float(self.config.lr),
+                "eps": float(self.config.eps),
+                "weight_decay": float(self.config.weight_decay),
+                "grad_clip_norm": float(self.config.grad_clip_norm),
+                "grad_accum_steps": int(self.config.grad_accum_steps),
+                "train_batch_size_per_process": int(self.config.train_batch_size),
+                "eval_batch_size_per_process": int(self.config.eval_batch_size),
+                "effective_batch_size_global": int(
+                    self.config.train_batch_size * self.config.grad_accum_steps * world_size
+                ),
+                "use_amp": bool(self.use_amp),
+                "amp_dtype": str(self.config.amp_dtype),
+                "gradient_checkpointing": bool(self.config.enable_gradient_checkpointing),
+            },
+            "system": {
+                "device": str(self.device),
+                "gpu_count_visible": int(torch.cuda.device_count()) if self.device.type == "cuda" else 0,
+                "peak_memory_gb": float(mem.get("peak_gb", 0.0)),
+                "allocated_memory_gb": float(mem.get("allocated_gb", 0.0)),
+                "reserved_memory_gb": float(mem.get("reserved_gb", 0.0)),
+            },
+        }
+
+        if extra:
+            payload.update(extra)
+        return payload
+
+    def save_results_json(
+        self,
+        path: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        if path is None:
+            if self.ckpt_dir:
+                path = os.path.join(self.ckpt_dir, "results.json")
+            else:
+                path = os.path.abspath("results.json")
+        payload = self.build_results_payload(extra=extra)
+        self._save_metadata_atomically(payload, path)
+        self._log(f"[Trainer] Saved results: {path}")
+        return path
   
-    def save_checkpoint(self, step: Optional[int] = None, prefix: str = "model") -> str:
+    def save_checkpoint(
+        self,
+        step: Optional[int] = None,
+        prefix: str = "model",
+        include_optimizer_state: Optional[bool] = None,
+        include_scaler_state: Optional[bool] = None,
+        include_training_step: bool = True,
+    ) -> str:
         step = self.global_step if step is None else int(step)
         if not self.ckpt_dir:
             raise ValueError("Checkpoint directory not configured.")
@@ -413,18 +578,25 @@ class Trainer:
         # Save config.json once (only if it doesn't exist)
         config_path = os.path.join(self.ckpt_dir, "config.json")
         if not os.path.exists(config_path):
-            config_data = asdict(self.config)
-            with open(config_path, "w") as f:
-                json.dump(config_data, f, indent=2)
+            save_config_json(
+                config_path=config_path,
+                training_cfg=self.config,
+                tokenizer=self.tokenizer,
+                model=self._unwrap_model(),
+            )
             self._log(f"[Trainer] Saved config: {config_path}")
         
         # Save checkpoint file in checkpoint root directory.
         fname = f"{prefix}_{step}.pt"
         path = os.path.join(self.ckpt_dir, fname)
-        payload = {
-            "model_state_dict": self.model.state_dict(),
-            "training_step": step,
-        }
+        model_to_save = self._unwrap_model()
+        payload = {"model_state_dict": model_to_save.state_dict()}
+        if include_training_step:
+            payload["training_step"] = step
+        if include_optimizer_state is None:
+            include_optimizer_state = bool(self.config.save_optimizer_state)
+        if include_scaler_state is None:
+            include_scaler_state = bool(include_optimizer_state)
 
         # Save tokenizer files once in checkpoint root.
         if self.tokenizer is not None:
@@ -433,12 +605,12 @@ class Trainer:
                 try:
                     self.tokenizer.save_pretrained(self.ckpt_dir)
                     self._log(f"[Trainer] Saved tokenizer files: {self.ckpt_dir}")
-                except Exception as e:
-                    self._log(f"[Trainer] Warning: Failed to save tokenizer: {e}")
+                except Exception:
+                    self._log_exception("[Trainer] Warning: Failed to save tokenizer")
 
-        if self.config.save_optimizer_state:
+        if include_optimizer_state:
             payload["optimizer_state_dict"] = self.optimizer.state_dict()
-        if self.scaler is not None:
+        if include_scaler_state and self.scaler is not None:
             try:
                 payload["scaler_state_dict"] = self.scaler.state_dict()
             except Exception:
@@ -447,16 +619,27 @@ class Trainer:
         self._log(f"[Trainer] Saved checkpoint: {path}")
         return path 
 
+    def save_final_checkpoint(self, step: Optional[int] = None, prefix: str = "final_ckpt") -> str:
+        ckpt_path = self.save_checkpoint(
+            step=step,
+            prefix=prefix,
+            include_optimizer_state=False,
+            include_scaler_state=False,
+            include_training_step=False,
+        )
+        self._save_checkpoint_metadata(ckpt_path, os.path.basename(ckpt_path))
+        return ckpt_path
+
     def load_checkpoint(self, path: str, map_location: Optional[torch.device] = None) -> Dict[str, Any]:
         if map_location is None:
             map_location = self.device
         data = torch.load(path, map_location=map_location)
-        self.model.load_state_dict(data["model_state_dict"], strict=True)
+        self._unwrap_model().load_state_dict(data["model_state_dict"], strict=True)
         if "optimizer_state_dict" in data and data["optimizer_state_dict"] is not None:
             try:
                 self.optimizer.load_state_dict(data["optimizer_state_dict"])
-            except Exception as e:
-                self._log(f"[Trainer] Warning: Failed to load optimizer state: {e}")
+            except Exception:
+                self._log_exception("[Trainer] Warning: Failed to load optimizer state")
         if "scaler_state_dict" in data and data["scaler_state_dict"] is not None:
             try:
                 self.scaler.load_state_dict(data["scaler_state_dict"])
@@ -468,14 +651,15 @@ class Trainer:
             self.total_steps = int(saved_cfg.get("total_steps")) if saved_cfg.get("total_steps") else None
             self.warmup_steps = int(saved_cfg.get("warmup_steps", self.warmup_steps))
         self._update_lr()
-        self.model.to(self.device)
+        self._unwrap_model().to(self.device)
         self._log(f"[Trainer] Loaded checkpoint from {path} (step {self.global_step})")
         return data
   
     # Validation loss estimation   
     def estimate_validation_loss(self, val_dataloader, num_batches: Optional[int] = None) -> float: 
         """Memory-efficient validation loss estimation."""
-        self.model.eval()
+        model_for_eval = self._unwrap_model()
+        model_for_eval.eval()
         num_batches = int(num_batches or self.config.validation_batch_count)
         total_loss = 0.0
         seen = 0 
@@ -489,8 +673,8 @@ class Trainer:
                 inputs, targets = self._unpack_batch(batch)
                 inputs = inputs.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
-                with torch.amp.autocast(enabled=self.use_amp, device_type=self.config.device, dtype=self.amp_dtype):
-                    model_out = self.model(inputs)
+                with torch.amp.autocast(enabled=self.use_amp, device_type=self.device.type, dtype=self.amp_dtype):
+                    model_out = model_for_eval(inputs)
                     loss = self._compute_loss(model_out, targets)
                 total_loss += loss.detach()
                 del inputs, targets, model_out, loss
@@ -544,7 +728,7 @@ class Trainer:
         )
         return loss
 
-    def train_step(self, batch) -> Dict[str, Any]:
+    def train_step(self, batch, sync_gradients: bool = True) -> Dict[str, Any]:
         """Perform forward + backward for a single batch."""
         self.model.train()
         inputs, targets = self._unpack_batch(batch)
@@ -552,12 +736,17 @@ class Trainer:
         targets = targets.to(self.device, non_blocking=True)
         accum_steps = max(1, int(self.config.grad_accum_steps)) 
 
-        with torch.amp.autocast(enabled=self.use_amp, device_type=self.config.device, dtype=self.amp_dtype):
-            model_out = self.model(inputs)
-            loss = self._compute_loss(model_out, targets)
+        sync_ctx = nullcontext()
+        if not sync_gradients and hasattr(self.model, "no_sync"):
+            sync_ctx = self.model.no_sync()
 
-        scaled_loss = loss / accum_steps
-        self.scaler.scale(scaled_loss).backward() 
+        with sync_ctx:
+            with torch.amp.autocast(enabled=self.use_amp, device_type=self.device.type, dtype=self.amp_dtype):
+                model_out = self.model(inputs)
+                loss = self._compute_loss(model_out, targets)
+
+            scaled_loss = loss / accum_steps
+            self.scaler.scale(scaled_loss).backward() 
         self._accum_counter += 1
 
         did_step = False
@@ -578,9 +767,9 @@ class Trainer:
 
             try:
                 self.scaler.step(self.optimizer)
-            except Exception as e:
+            except Exception:
                 self.scaler.update()
-                raise e
+                raise
             else:
                 self.scaler.update()
                 did_step = True
@@ -643,6 +832,8 @@ class Trainer:
             unit="step",
             dynamic_ncols=True,
             leave=True,
+            file=sys.stdout,
+            disable=not self.show_progress_bar,
         )
         
         # Tracking for smoother progress bar updates
@@ -674,6 +865,22 @@ class Trainer:
                         self._last_step_time = now
 
                         avg_loss = running_loss / loss_count
+                        validated_this_step = False
+
+                        if val_dataloader is not None and self.config.validation_batch_count:
+                            if self.global_step % max(1, self.config.log_interval_steps) == 0:
+                                try:
+                                    last_val_loss = self.estimate_validation_loss(
+                                        val_dataloader,
+                                        num_batches=self.config.validation_batch_count
+                                    )
+                                    self._final_val_loss = last_val_loss
+                                    if last_val_loss < self._best_val_loss:
+                                        self._best_val_loss = last_val_loss
+                                        self._best_val_loss_step = self.global_step
+                                    validated_this_step = True
+                                except Exception:
+                                    self._log_exception("[Trainer] Warning: Validation failed")
 
                         postfix = self._build_progress_postfix(
                             avg_loss=avg_loss,
@@ -683,6 +890,15 @@ class Trainer:
                         )
                         pbar.set_postfix(postfix)
                         pbar.update(1)
+                        current_val_loss = last_val_loss if validated_this_step else None
+                        self._log_step_metrics(
+                            step=self.global_step,
+                            train_loss=avg_loss,
+                            lr=step_info["lr"],
+                            grad_norm=step_info["grad_norm"],
+                            val_loss=current_val_loss,
+                            iter_time_s=iter_time_s,
+                        )
 
                         if self._should_log_step(self.global_step):
                             if self.config.log_per_iteration_time:
@@ -695,7 +911,7 @@ class Trainer:
                                     train_loss=avg_loss,
                                     lr=step_info["lr"],
                                     grad_norm=step_info["grad_norm"],
-                                    val_loss=last_val_loss,
+                                    val_loss=current_val_loss,
                                     iter_time_s=step_time,
                                 )
                             )
@@ -710,23 +926,8 @@ class Trainer:
                             if self.global_step % int(self.config.ckpt_interval_steps) == 0:
                                 try:
                                     self.save_checkpoint(step=self.global_step)
-                                except Exception as e:
-                                    self._log(f"[Trainer] Warning: Checkpoint save failed: {e}")
-
-                        if val_dataloader is not None and self.config.validation_batch_count:
-                            if self.global_step % max(1, self.config.log_interval_steps) == 0:
-                                try:
-                                    last_val_loss = self.estimate_validation_loss(
-                                        val_dataloader, 
-                                        num_batches=self.config.validation_batch_count
-                                    )
-                                    self._final_val_loss = last_val_loss
-                                    if last_val_loss < self._best_val_loss:
-                                        self._best_val_loss = last_val_loss
-                                        self._best_val_loss_step = self.global_step
-                                    self._log(f"[Trainer] Step {self.global_step}: val_loss={last_val_loss:.4f}")
-                                except Exception as e:
-                                    self._log(f"[Trainer] Warning: Validation failed: {e}")
+                                except Exception:
+                                    self._log_exception("[Trainer] Warning: Checkpoint save failed")
 
                     # Stopping condition
                     if global_step_target is not None and self.global_step >= global_step_target:
@@ -752,22 +953,213 @@ class Trainer:
             mem = self.get_memory_summary()
             self._log(f"[Trainer] Peak GPU memory: {mem['peak_gb']:.2f}GB")
         
-        # Final checkpoint with metadata (skip if already saved at interval)
-        already_saved = (
-            self.config.ckpt_interval_steps
-            and self.global_step % int(self.config.ckpt_interval_steps) == 0
-        )
-        if self.ckpt_dir and not already_saved:
-            try:
-                ckpt_path = self.save_checkpoint(step=self.global_step, prefix="final_ckpt")
-                self._save_checkpoint_metadata(ckpt_path, os.path.basename(ckpt_path))
-            except Exception as e:
-                self._log(f"[Trainer] Warning: Final checkpoint save failed: {e}")
  
 
+    def train_distributed(
+        self,
+        train_dataloader,
+        val_dataloader=None,
+        epochs: Optional[int] = 1,
+        max_steps: Optional[int] = None,
+    ):
+        """
+        Distributed training loop using torch.distributed.
+        Safely handles DistributedSampler epochs, rank-0 logging/checkpointing,
+        and DDP-aware validation.
+        """
+        import torch.distributed as dist
+        
+        is_dist = dist.is_available() and dist.is_initialized()
+        if not is_dist:
+            self._log("[Trainer] torch.distributed is not initialized. Falling back to single-process train().")
+            return self.train(
+                train_dataloader=train_dataloader,
+                val_dataloader=val_dataloader,
+                epochs=epochs,
+                max_steps=max_steps,
+            )
+
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        is_main = rank == 0
+
+        if not isinstance(self.model, DDP):
+            if self.device.type == "cuda":
+                device_index = self.device.index
+                if device_index is None:
+                    device_index = torch.cuda.current_device()
+                self.model = DDP(
+                    self.model,
+                    device_ids=[device_index],
+                    output_device=device_index,
+                    broadcast_buffers=False,
+                    find_unused_parameters=False,
+                )
+            else:
+                self.model = DDP(self.model, broadcast_buffers=False)
+            if is_main:
+                self._log(f"[Trainer] Wrapped model with DDP (world_size={world_size})")
+
+        if self.config.seed is not None:
+            torch.manual_seed(self.config.seed + rank)
+
+        # Infer total_steps
+        if max_steps is not None:
+            self.total_steps = int(max_steps)
+        elif self.total_steps is None:
+            try:
+                steps_per_epoch = len(train_dataloader)
+            except Exception:
+                steps_per_epoch = None
+            if steps_per_epoch:
+                approx_total = int(math.ceil(steps_per_epoch * float(epochs) / max(1, self.config.grad_accum_steps)))
+                self.total_steps = approx_total
+
+        if is_main:
+            self._train_start_time = time.perf_counter()
+            self._last_step_time = self._train_start_time
+            
+        self.model.train()
+
+        global_step_target = None if self.total_steps is None else int(self.total_steps)
+        
+        pbar = None
+        if is_main:
+            pbar = tqdm(
+                total=global_step_target,
+                initial=self.global_step,
+                desc=f"Distributed Training (world={world_size})",
+                unit="step",
+                dynamic_ncols=True,
+                leave=True,
+                file=sys.stdout,
+                disable=not self.show_progress_bar,
+            )
+        
+        running_loss = 0.0
+        loss_count = 0
+        last_val_loss = None
+
+        stop_requested = False
+        epoch = 0
+        use_epoch_limit = global_step_target is None
+        accum_steps = max(1, int(self.config.grad_accum_steps))
+
+        try:
+            while not stop_requested:
+                if use_epoch_limit and epoch >= epochs:
+                    break
+                    
+                # Support DistributedSampler
+                if hasattr(train_dataloader, "sampler") and hasattr(train_dataloader.sampler, "set_epoch"):
+                    train_dataloader.sampler.set_epoch(epoch)
+                    
+                epoch += 1
+                for batch in train_dataloader:
+                    should_sync = (self._accum_counter + 1) >= accum_steps
+                    step_info = self.train_step(batch, sync_gradients=should_sync)
+                    
+                    running_loss += step_info["loss"]
+                    loss_count += 1
+
+                    if is_main:
+                        self._track_step_metadata(step_info["loss"], batch)
+
+                    if step_info["did_step"]:
+                        validated_this_step = False
+                        if is_main and val_dataloader is not None and self.config.validation_batch_count:
+                            if self.global_step % max(1, self.config.log_interval_steps) == 0:
+                                try:
+                                    val_loss = self.estimate_validation_loss(
+                                        val_dataloader,
+                                        num_batches=self.config.validation_batch_count
+                                    )
+                                    last_val_loss = val_loss
+                                    self._final_val_loss = last_val_loss
+                                    if last_val_loss < self._best_val_loss:
+                                        self._best_val_loss = last_val_loss
+                                        self._best_val_loss_step = self.global_step
+                                    validated_this_step = True
+                                except Exception:
+                                    self._log_exception("[Trainer] Warning: Validation failed")
+
+                        if is_main:
+                            now = time.perf_counter()
+                            iter_time_s = now - self._last_step_time if self._last_step_time else None
+                            self._last_step_time = now
+
+                            avg_loss = running_loss / loss_count
+
+                            postfix = self._build_progress_postfix(
+                                avg_loss=avg_loss,
+                                lr=step_info["lr"],
+                                grad_norm=step_info["grad_norm"],
+                                val_loss=last_val_loss,
+                            )
+                            pbar.set_postfix(postfix)
+                            pbar.update(1)
+                            current_val_loss = last_val_loss if validated_this_step else None
+                            self._log_step_metrics(
+                                step=self.global_step,
+                                train_loss=avg_loss,
+                                lr=step_info["lr"],
+                                grad_norm=step_info["grad_norm"],
+                                val_loss=current_val_loss,
+                                iter_time_s=iter_time_s,
+                            )
+
+                            if self._should_log_step(self.global_step):
+                                step_time = iter_time_s if self.config.log_per_iteration_time else None
+                                self._log(
+                                    self._build_step_log_message(
+                                        step=self.global_step,
+                                        train_loss=avg_loss,
+                                        lr=step_info["lr"],
+                                        grad_norm=step_info["grad_norm"],
+                                        val_loss=current_val_loss,
+                                        iter_time_s=step_time,
+                                    )
+                                )
+                            
+                        if self.global_step % 100 == 0:
+                            running_loss = 0.0
+                            loss_count = 0
+
+                        # Checkpointing (Main node only)
+                        if is_main and self.ckpt_dir and self.config.ckpt_interval_steps:
+                            if self.global_step % int(self.config.ckpt_interval_steps) == 0:
+                                try:
+                                    self.save_checkpoint(step=self.global_step)
+                                except Exception:
+                                    self._log_exception("[Trainer] Warning: Checkpoint save failed")
+
+                    if global_step_target is not None and self.global_step >= global_step_target:
+                        stop_requested = True
+                        break
+                
+                self._clear_cuda_cache()
+
+                if stop_requested:
+                    if is_main:
+                        self._log(f"[Trainer] Stop requested ...")
+                    break
+
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+        if is_main:
+            total_wall = time.perf_counter() - self._train_start_time
+            self._total_training_time = total_wall
+            
+            self._log(f"[Trainer] Training complete: {self.global_step} steps in {total_wall:.1f}s ({total_wall/60:.1f}min)")
+            if self.device.type == "cuda":
+                mem = self.get_memory_summary()
+                self._log(f"[Trainer] Peak GPU memory: {mem['peak_gb']:.2f}GB")
+            
     def state_dict(self) -> Dict[str, Any]: 
         state = {
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": self._unwrap_model().state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scaler_state_dict": getattr(self.scaler, "state_dict", lambda: None)(),
             "global_step": self.global_step,
@@ -776,12 +1168,12 @@ class Trainer:
         return state
 
     def load_state_dict(self, state: Dict[str, Any]):  
-        self.model.load_state_dict(state["model_state_dict"])
+        self._unwrap_model().load_state_dict(state["model_state_dict"])
         if "optimizer_state_dict" in state and state["optimizer_state_dict"] is not None:
             try:
                 self.optimizer.load_state_dict(state["optimizer_state_dict"])
-            except Exception as e:
-                self._log(f"[Trainer] Warning: optimizer state load failed: {e}")
+            except Exception:
+                self._log_exception("[Trainer] Warning: optimizer state load failed")
         if "scaler_state_dict" in state and state["scaler_state_dict"] is not None:
             try:
                 self.scaler.load_state_dict(state["scaler_state_dict"])

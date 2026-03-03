@@ -19,6 +19,20 @@ class GQARopeAttention(GroupedQueryAttention):
         self.rope = RotaryPositionEmbedding(self.head_dim, block_size)
         self.dropout = nn.Dropout(dropout)
         self.attn_dropout_p = float(dropout)
+        self.qk_norm_eps = 1e-6
+        self.q_scale = nn.Parameter(
+            torch.full((self.n_head, 1, 1), self.head_dim ** 0.5)
+        )
+        self.has_sdpa = hasattr(F, "scaled_dot_product_attention")
+        sdpa_doc = getattr(F.scaled_dot_product_attention, "__doc__", "") if self.has_sdpa else ""
+        self.sdpa_has_gqa = "enable_gqa" in (sdpa_doc or "")
+
+    def _causal_mask(self, t_q: int, t_k: int, position_offset: int, device: torch.device) -> torch.Tensor:
+        if position_offset == 0 and t_q == t_k:
+            return self.tril[:t_q, :t_k].to(device=device, dtype=torch.bool)
+        q_pos = position_offset + torch.arange(t_q, device=device).unsqueeze(1)
+        k_pos = torch.arange(t_k, device=device).unsqueeze(0)
+        return k_pos <= q_pos
 
     def forward(self, x, kv_cache=None, position_offset=0):
         B, T, C = x.shape
@@ -32,33 +46,49 @@ class GQARopeAttention(GroupedQueryAttention):
         v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
         q, k = self.rope(q, k, position_offset=position_offset)
+        q = F.normalize(q, p=2.0, dim=-1, eps=self.qk_norm_eps)
+        k = F.normalize(k, p=2.0, dim=-1, eps=self.qk_norm_eps)
+        q = q * self.q_scale
 
         if kv_cache is not None:
             k, v = kv_cache.update(k, v)
 
-        if self.groups > 1:
-            k = k.repeat_interleave(self.groups, dim=1)
-            v = v.repeat_interleave(self.groups, dim=1)
+        if self.has_sdpa:
+            sdpa_kwargs = {
+                "attn_mask": None,
+                "dropout_p": self.attn_dropout_p if self.training else 0.0,
+                "is_causal": True,
+            }
+            use_native_gqa = self.groups > 1 and self.sdpa_has_gqa
 
-        if hasattr(F, "scaled_dot_product_attention"):
+            if kv_cache is not None:
+                t_q = q.size(-2)
+                t_k = k.size(-2)
+                if position_offset > 0 or t_q != t_k:
+                    sdpa_kwargs["attn_mask"] = self._causal_mask(t_q, t_k, position_offset, q.device)
+                    sdpa_kwargs["is_causal"] = False
+
+            if use_native_gqa:
+                sdpa_kwargs["enable_gqa"] = True
+            elif self.groups > 1:
+                k = k.repeat_interleave(self.groups, dim=1)
+                v = v.repeat_interleave(self.groups, dim=1)
+
             attn = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
-                attn_mask=None,
-                dropout_p=self.attn_dropout_p if self.training else 0.0,
-                is_causal=True,
+                **sdpa_kwargs,
             )
         else:
+            if self.groups > 1:
+                k = k.repeat_interleave(self.groups, dim=1)
+                v = v.repeat_interleave(self.groups, dim=1)
+
             att = (q @ k.transpose(-2, -1)) * self.scale
             Tq = q.size(-2)
             Tk = k.size(-2)
-            if position_offset == 0 and Tq == Tk:
-                mask = torch.tril(torch.ones(Tq, Tk, device=att.device, dtype=torch.bool))
-            else:
-                q_pos = position_offset + torch.arange(Tq, device=att.device).unsqueeze(1)
-                k_pos = torch.arange(Tk, device=att.device).unsqueeze(0)
-                mask = k_pos <= q_pos
+            mask = self._causal_mask(Tq, Tk, position_offset, att.device)
             att = att.masked_fill(~mask, float("-inf"))
             att = F.softmax(att, dim=-1)
             att = self.dropout(att)
@@ -146,9 +176,9 @@ class GQATransformer(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None, kv_cache=None):
-        B, T = idx.shape
-        assert T <= self.block_size
-        assert idx.max() < self.token_emb.num_embeddings
+        T = idx.shape[1]
+        if T > self.block_size:
+            raise ValueError(f"Sequence length {T} exceeds block size {self.block_size}")
 
         x = self.drop(self.token_emb(idx))
 
@@ -164,9 +194,11 @@ class GQATransformer(nn.Module):
 
         loss = None
         if targets is not None:
-            logits = logits.view(B * T, -1)
-            targets = targets.view(B * T)
-            loss = F.cross_entropy(logits, targets, label_smoothing=0.0)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                label_smoothing=0.0,
+            )
 
         return logits, loss
 
@@ -175,19 +207,44 @@ class GQATransformer(nn.Module):
         if new_vocab_size == old_vocab_size:
             return
 
-        new_token_emb = nn.Embedding(new_vocab_size, n_emb)
+        device = self.token_emb.weight.device
+        dtype = self.token_emb.weight.dtype
+
+        new_token_emb = nn.Embedding(new_vocab_size, n_emb, device=device, dtype=dtype)
         torch.nn.init.normal_(new_token_emb.weight, mean=0.0, std=0.02)
 
         num_to_copy = min(old_vocab_size, new_vocab_size)
-        new_token_emb.weight.data[:num_to_copy] = self.token_emb.weight.data[:num_to_copy]
+        with torch.no_grad():
+            new_token_emb.weight[:num_to_copy].copy_(self.token_emb.weight[:num_to_copy])
 
         self.token_emb = new_token_emb
-        new_lm_head = nn.Linear(n_emb, new_vocab_size, bias=False)
-        new_lm_head.weight.data[:num_to_copy] = self.lm_head.weight.data[:num_to_copy]
+        new_lm_head = nn.Linear(n_emb, new_vocab_size, bias=False, device=device, dtype=dtype)
+        torch.nn.init.normal_(new_lm_head.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            new_lm_head.weight[:num_to_copy].copy_(self.lm_head.weight[:num_to_copy])
         self.lm_head = new_lm_head
         self.lm_head.weight = self.token_emb.weight
 
-    @torch.no_grad()
+    def _sample_next_token(self, logits, idx, temperature, top_k, repetition_penalty):
+        if temperature == 0.0:
+            return torch.argmax(logits, dim=-1, keepdim=True)
+
+        logits = logits / temperature
+
+        if repetition_penalty != 1.0:
+            penalized = logits.gather(1, idx) / repetition_penalty
+            logits = logits.scatter(1, idx, penalized)
+
+        if top_k is not None:
+            k = min(int(top_k), logits.size(-1))
+            if k > 0:
+                threshold = torch.topk(logits, k, dim=-1).values[:, [-1]]
+                logits = logits.masked_fill(logits < threshold, float("-inf"))
+
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
+    @torch.inference_mode()
     def generate(
         self,
         idx,
@@ -199,66 +256,43 @@ class GQATransformer(nn.Module):
         use_cache=True,
     ):
         self.eval()
-
-        if not use_cache:
-            for _ in range(max_new_tokens):
-                idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size :]
-                logits, _ = self.forward(idx_cond)
-                logits = logits[:, -1, :]
-
-                if temperature == 0.0:
-                    idx_next = torch.argmax(logits, dim=-1, keepdim=True)
-                else:
-                    logits = logits / temperature
-                    if repetition_penalty != 1.0:
-                        unique_tokens = torch.unique(idx)
-                        logits[:, unique_tokens] = logits[:, unique_tokens] / repetition_penalty
-
-                    if top_k is not None:
-                        v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                        logits[logits < v[:, [-1]]] = -float("inf")
-
-                    probs = F.softmax(logits, dim=-1)
-                    idx_next = torch.multinomial(probs, num_samples=1)
-
-                if eos_token_id is not None and idx_next.item() == eos_token_id:
-                    break
-
-                idx = torch.cat([idx, idx_next], dim=1)
-
-            return idx
-
         idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size :]
-        kv_cache = self.build_kv_cache(
-            max_batch_size=idx_cond.size(0),
-            device=idx_cond.device,
-            dtype=self.token_emb.weight.dtype,
-        )
-        logits, _ = self.forward(idx_cond, kv_cache=kv_cache)
+
+        if use_cache:
+            max_cache_new_tokens = self.block_size - idx_cond.size(1)
+            if max_new_tokens > max_cache_new_tokens:
+                use_cache = False
+
+        kv_cache = None
+        logits = None
+        if use_cache:
+            kv_cache = self.build_kv_cache(
+                max_batch_size=idx_cond.size(0),
+                device=idx_cond.device,
+                dtype=self.token_emb.weight.dtype,
+            )
+            logits, _ = self.forward(idx_cond, kv_cache=kv_cache)
 
         for _ in range(max_new_tokens):
-            logits = logits[:, -1, :]
+            if not use_cache:
+                idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size :]
+                logits, _ = self.forward(idx_cond)
 
-            if temperature == 0.0:
-                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
-            else:
-                logits = logits / temperature
-                if repetition_penalty != 1.0:
-                    unique_tokens = torch.unique(idx)
-                    logits[:, unique_tokens] = logits[:, unique_tokens] / repetition_penalty
+            next_token_logits = logits[:, -1, :]
+            idx_next = self._sample_next_token(
+                next_token_logits,
+                idx,
+                temperature=temperature,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+            )
 
-                if top_k is not None:
-                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                    logits[logits < v[:, [-1]]] = -float("inf")
-
-                probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1)
-
-            if eos_token_id is not None and idx_next.item() == eos_token_id:
+            if eos_token_id is not None and torch.all(idx_next.squeeze(-1).eq(eos_token_id)):
                 break
 
             idx = torch.cat([idx, idx_next], dim=1)
-            logits, _ = self.forward(idx_next, kv_cache=kv_cache)
+            if use_cache:
+                logits, _ = self.forward(idx_next, kv_cache=kv_cache)
 
         return idx
 

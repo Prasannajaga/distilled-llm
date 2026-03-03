@@ -32,10 +32,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to output model directory (example: ./output/mini-math-student)",
     )
     parser.add_argument(
-        "--checkpoint",
+        "--model-name",
         type=str,
+        dest="model_name",
         default=None,
-        help="Optional explicit checkpoint (.pt). Defaults to latest checkpoint in --output.",
+        help="Optional explicit model/checkpoint (.pt) file. Defaults to latest checkpoint in --output.",
     )
     parser.add_argument(
         "--device",
@@ -91,7 +92,7 @@ def _extract_step(path: Path) -> int:
 
 def find_checkpoint(output_dir: Path, explicit_checkpoint: str | None) -> Path:
     if explicit_checkpoint:
-        checkpoint = Path(explicit_checkpoint)
+        checkpoint = Path(str(output_dir) + "/" + explicit_checkpoint)
         if not checkpoint.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
         return checkpoint
@@ -120,9 +121,29 @@ def load_saved_config(output_dir: Path) -> TrainingConfig:
         return cfg
 
     data: dict[str, Any] = json.loads(config_path.read_text())
-    for key, value in data.items():
+    training_config = data.get("training_config", data)
+    if not isinstance(training_config, dict):
+        training_config = {}
+
+    for key, value in training_config.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)
+
+    # Backward-compatible mapping for model-style keys.
+    model_config = data.get("model_config", {})
+    if isinstance(model_config, dict):
+        key_map = {
+            "num_hidden_layers": "n_layer",
+            "hidden_size": "n_embd",
+            "num_attention_heads": "n_head",
+            "max_position_embeddings": "block_size",
+        }
+        for src_key, dst_key in key_map.items():
+            if hasattr(cfg, dst_key) and src_key in model_config:
+                try:
+                    setattr(cfg, dst_key, int(model_config[src_key]))
+                except Exception:
+                    pass
     return cfg
 
 
@@ -228,7 +249,7 @@ def main() -> None:
     args = parse_args()
 
     output_dir = find_output_dir(args.output)
-    checkpoint_path = find_checkpoint(output_dir, args.checkpoint)
+    checkpoint_path = find_checkpoint(output_dir, args.model_name)
 
     config = load_saved_config(output_dir)
     apply_inference_overrides(config, args)

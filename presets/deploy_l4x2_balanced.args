@@ -1,18 +1,14 @@
-# Required project args
---project_id YOUR_PROJECT_ID
---region us-central1
---bucket_uri gs://YOUR_BUCKET
-
 # Job metadata
 --display_name distilled-llm-l4x2-balanced
---base_output_dir gs://YOUR_BUCKET/training_logs/balanced
---staging_bucket gs://YOUR_BUCKET
+--base_output_dir gs://transformer-garage/training_logs/mini-math-balanced-v1
+--staging_bucket gs://transformer-garage
 
 # Machine config
 --machine_type g2-standard-24
 --accelerator_type NVIDIA_L4
 --accelerator_count 2
 --replica_count 1
+--boot_disk_size 200
 --train_image us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest
 
 # Launcher
@@ -35,8 +31,8 @@
 --train_device cuda
 --train_seed 42
 --train_num_workers 8
---n_layer 16
---n_embd 1024
+--n_layer 18
+--n_embd 768
 --n_head 16
 --train_batch_size 4
 --eval_batch_size 2
