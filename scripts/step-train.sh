@@ -19,6 +19,7 @@ DATA_NUM_WORKERS="${DATA_NUM_WORKERS:-$(nproc)}"
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}"
 DATASETS_JSON="${DATASETS_JSON:-}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-${WORLD_SIZE:-1}}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "========================================="
 echo " Step 1: Build Single Packed Bin"

@@ -1,5 +1,5 @@
 # Job metadata
---display_name distilled-llm-l4x2-balanced
+--display_name distilled-llm-l4x2-balanced-v4
 --base_output_dir gs://transformer-garage/training_logs/mini-math-balanced-v1
 --staging_bucket gs://transformer-garage
 
@@ -8,7 +8,7 @@
 --accelerator_type NVIDIA_L4
 --accelerator_count 2
 --replica_count 1
---boot_disk_size 200
+--boot_disk_size 350
 --train_image us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest
 
 # Launcher
@@ -23,20 +23,20 @@
 --data_bin_name data.bin
 --block_size 1024
 --datasets_json /home/prasanna/coding/distilled-llm/data/dataset_mixture.json
---data_num_workers 10
---data_pack_batch_size 768
+--data_num_workers 22
+--data_pack_batch_size 4096
 --tokenizer_model TinyLlama/TinyLlama-1.1B-Chat-v1.0
 
 # Training/model
 --train_device cuda
 --train_seed 42
---train_num_workers 8
+--train_num_workers 12
 --n_layer 18
 --n_embd 768
 --n_head 16
---train_batch_size 4
+--train_batch_size 6
 --eval_batch_size 2
---grad_accum_steps 8
+--grad_accum_steps 12
 --validation_batch_count 20
 --val_ratio 0.15
 --optimizer adamw
@@ -47,11 +47,14 @@
 --use_amp 1
 --amp_dtype bfloat16
 --enable_gradient_checkpointing 1
+--enable_metrics 0
+--enable_vertex 1
 --total_steps 6000
 --warmup_steps 600
---ckpt_interval_steps 500
+--ckpt_interval_steps 3000
 --save_optimizer_state 1
 --log_interval_steps 100
 
 # Optional:
+# --metrics_prompts_json /home/prasanna/coding/distilled-llm/data/metrics_prompts.json
 # --async_run

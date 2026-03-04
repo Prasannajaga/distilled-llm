@@ -46,9 +46,14 @@
 --use_amp 1
 --amp_dtype bfloat16
 --enable_gradient_checkpointing 1
+--enable_metrics 0
+--enable_vertex 1
 --total_steps 8000
 --warmup_steps 800
 --ckpt_interval_steps 400
 --save_optimizer_state 0
 --log_interval_steps 50
+
+# Optional:
+# --metrics_prompts_json /home/prasanna/coding/distilled-llm/data/metrics_prompts.json
 --async_run

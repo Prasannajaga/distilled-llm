@@ -25,4 +25,6 @@ uv run python deploy.py @presets/deploy_l4x2_baseline.args \
 ## Notes
 
 - Replace `YOUR_PROJECT_ID` and `gs://YOUR_BUCKET` in the preset file (or override via CLI).
-- `datasets_json` is set to empty string in presets, so default dataset mixture in `scripts/loadDataset.py` is used.
+- `datasets_json` can be a local file path or inline JSON.
+- `enable_vertex` toggles Vertex experiment tracking/logging artifacts.
+- `enable_metrics` + `metrics_prompts_json` runs prompt-based post-train metrics and writes JSON artifacts.
