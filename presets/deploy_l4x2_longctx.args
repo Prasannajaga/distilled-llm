@@ -16,6 +16,10 @@
 --local_ckpt_dir /outputs/mini-code-v1
 --train_log_level INFO
 --train_progress_bar 0
+--train_vertex_project YOUR_PROJECT_ID
+--train_vertex_location us-central1
+--train_vertex_experiment_name distilled-llm-longctx
+--train_vertex_run_name distilled-llm-l4x2-longctx
 
 # Dataset packing
 --data_bin_dir /tmp/vertex-bins
@@ -48,6 +52,8 @@
 --enable_gradient_checkpointing 1
 --enable_metrics 0
 --enable_vertex 1
+--enable_tensorboard 1
+--tensorboard_hist_interval_steps 500
 --total_steps 8000
 --warmup_steps 800
 --ckpt_interval_steps 400

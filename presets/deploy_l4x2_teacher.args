@@ -1,6 +1,6 @@
 # Job metadata
---display_name distilled-llm-l4x2-balanced-v4
---base_output_dir gs://transformer-garage/training_logs/mini-math-balanced-v1
+--display_name distilled-llm-l4x2-balanced-v5-30k
+--base_output_dir gs://transformer-garage/training_logs/mini-math-teacher-v1-30K
 --staging_bucket gs://transformer-garage
 
 # Machine config
@@ -8,7 +8,7 @@
 --accelerator_type NVIDIA_L4
 --accelerator_count 2
 --replica_count 1
---boot_disk_size 350
+--boot_disk_size 300
 --train_image us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest
 
 # Launcher
@@ -17,17 +17,23 @@
 --local_ckpt_dir /outputs/mini-code-v1
 --train_log_level INFO
 --train_progress_bar 1
+--train_vertex_project transformer-garagegarage
+--train_vertex_location us-central1
+--train_vertex_experiment_name mini-math-balanced-v1
+--train_vertex_run_name mini-math-teacher-v1-30K
 
 # Dataset packing
 --data_bin_dir /tmp/vertex-bins
 --data_bin_name data.bin
---block_size 1024
 --datasets_json /home/prasanna/coding/distilled-llm/data/dataset_mixture.json
---data_num_workers 22
---data_pack_batch_size 4096
+--data_num_workers 18
+--data_pack_batch_size 2042
 --tokenizer_model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+--enable_bucket 1
+--dataset_name mini-math-teacher-v1-30K
 
-# Training/model
+# Training/model 
+--block_size 1024
 --train_device cuda
 --train_seed 42
 --train_num_workers 12
@@ -38,23 +44,27 @@
 --eval_batch_size 2
 --grad_accum_steps 12
 --validation_batch_count 20
---val_ratio 0.15
+--val_ratio 0.20
 --optimizer adamw
---lr 1.5e-4
+--lr 1.2e-4
 --eps 1e-8
 --weight_decay 0.1
 --grad_clip_norm 1.0
 --use_amp 1
 --amp_dtype bfloat16
 --enable_gradient_checkpointing 1
---enable_metrics 0
+--enable_metrics 1
 --enable_vertex 1
---total_steps 6000
---warmup_steps 600
---ckpt_interval_steps 3000
+--enable_tensorboard 1
+--tensorboard_hist_interval_steps 500
+--total_steps 30000
+--warmup_steps 3000
+--ckpt_interval_steps 10000
 --save_optimizer_state 1
 --log_interval_steps 100
 
+# End-of-run prompt eval
+--metrics_prompts_json /home/prasanna/coding/distilled-llm/data/metrics_prompts.json
+
 # Optional:
-# --metrics_prompts_json /home/prasanna/coding/distilled-llm/data/metrics_prompts.json
 # --async_run

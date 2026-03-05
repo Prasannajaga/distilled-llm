@@ -1,43 +1,120 @@
-```mermaid
-graph TD
-    classDef main fill:#f9f,stroke:#333,stroke-width:2px;
-    classDef gpu0 fill:#bbf,stroke:#333,stroke-width:2px;
-    classDef gpu1 fill:#bfb,stroke:#333,stroke-width:2px;
-    classDef sync fill:#fbf,stroke:#333,stroke-width:4px,stroke-dasharray: 5 5;
+# Distilled LLM (Teacher -> Student)
 
-    Dataset[Full Dataset: 1000 items]:::main
-    
-    subgraph "Process 0 (GPU 0)"
-        Sampler0[DistributedSampler<br/>Takes items 0, 2, 4...]:::gpu0
-        Model0[DDP Model Replica 0]:::gpu0
-        Loss0[Compute Loss 0]:::gpu0
-        Grad0[Compute Gradients 0]:::gpu0
-    end
+A practical project to learn and build end-to-end LLM distillation:
 
-    subgraph "Process 1 (GPU 1)"
-        Sampler1[DistributedSampler<br/>Takes items 1, 3, 5...]:::gpu1
-        Model1[DDP Model Replica 1]:::gpu1
-        Loss1[Compute Loss 1]:::gpu1
-        Grad1[Compute Gradients 1]:::gpu1
-    end
+- dataset ingestion + packing
+- pretraining and distillation loops
+- local and Vertex AI training
+- inference and deployment utilities
 
-    Dataset --> Sampler0
-    Dataset --> Sampler1
-    
-    Sampler0 --> |Batch A| Model0
-    Sampler1 --> |Batch B| Model1
-    
-    Model0 --> Loss0
-    Model1 --> Loss1
-    
-    Loss0 --> Grad0
-    Loss1 --> Grad1
-    
-    AllReduce((All-Reduce:<br/>Average Gradients<br/>Across GPUs)):::sync
-    
-    Grad0 --> AllReduce
-    Grad1 --> AllReduce
-    
-    AllReduce --> |Update Model 0| Model0
-    AllReduce --> |Update Model 1| Model1
+For detailed journey notes and deployment history:
+
+- [progress.md](./progress.md)
+- [deploy.md](./deploy.md)
+
+## Project Architecture
+
+At a high level, the repo is split into 4 layers.
+
+### 1) Model layer
+
+- `scripts/model.py`
+- `utils/transformer.py`
+
+Contains:
+
+- GQA + RoPE attention blocks
+- RMSNorm + SwiGLU FFN
+- KV-cache aware generation
+- recent optimizations (QK normalization, FFN alignment)
+
+### 2) Data layer
+
+- `utils/packed_dataset_builder.py`
+- `scripts/loadDataset.py` (called in pipeline)
+- `Cdatasets/*`
+
+Flow:
+
+1. load HF dataset(s)
+2. tokenize
+3. pack into fixed block-size chunks
+4. save packed bin/index
+5. memory-map for training dataloaders
+
+### 3) Training layer
+
+- `utils/trainer.py`
+- `scripts/train_pretrain.py`
+- `scripts/train_distill.py`
+- `scripts/train_vertex.py`
+
+Covers:
+
+- mixed precision
+- gradient accumulation
+- checkpoint/resume
+- optional distributed training (DDP)
+- Vertex experiment hooks/logging
+
+### 4) Deployment/ops layer
+
+- `deploy.py`
+- `scripts/step-train.sh`
+- `scripts/run_step_train.py`
+
+Covers:
+
+- package + upload source dist
+- submit Vertex custom job
+- run worker-side data packing then training
+
+## Simple Usage
+
+### 1) Local pretraining
+
+```bash
+python -m scripts.train_pretrain \
+  --bin_path ./data/pretrain_tokens.bin \
+  --epochs 1
 ```
+
+### 2) Local inference
+
+```bash
+python -m scripts.infer --output ./output/<model-dir> "hello"
+```
+
+### 3) Vertex deployment
+
+```bash
+python deploy.py \
+  --project_id <gcp-project> \
+  --region us-central1 \
+  --bucket_uri gs://<bucket> \
+  --machine_type g2-standard-24 \
+  --accelerator_type NVIDIA_L4 \
+  --accelerator_count 2 \
+  --boot_disk_size 300
+```
+
+### 4) Worker pipeline entry
+
+```bash
+bash scripts/step-train.sh --epochs 1 --total_steps 100
+```
+
+## Key Files to Start With
+
+- `scripts/model.py`: model architecture and generation
+- `utils/transformer.py`: attention/FFN/norm primitives
+- `utils/trainer.py`: train loop + checkpointing
+- `deploy.py`: Vertex submission entrypoint
+- `scripts/step-train.sh`: worker-side step pipeline
+
+## Notes
+
+- Keep `block_size` consistent across packing and training.
+- For large dataset packing on Vertex, disk sizing matters a lot.
+- For deeper progress details, read [progress.md](./progress.md).
+- For failures/fixes during deployment, read [deploy.md](./deploy.md).

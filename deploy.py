@@ -24,6 +24,19 @@ class FileArgParser(argparse.ArgumentParser):
         return shlex.split(line)
 
 
+def _parse_bool_flag(value: str | int | bool) -> int:
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int):
+        return 1 if value != 0 else 0
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return 1
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return 0
+    raise argparse.ArgumentTypeError(f"Invalid boolean flag value: {value!r}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = FileArgParser(
         description="Build package and submit Vertex AI Custom Job",
@@ -49,13 +62,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local_ckpt_dir", type=str, default="/outputs/mini-code-v1")
     parser.add_argument("--train_log_level", type=str, default="INFO")
     parser.add_argument("--train_progress_bar", type=int, default=0, choices=[0, 1], help="Enable (1) or disable (0) tqdm progress bars")
+    parser.add_argument("--train_vertex_project", type=str, default=None, help="Override TRAIN_VERTEX_PROJECT env inside worker")
+    parser.add_argument("--train_vertex_location", type=str, default=None, help="Override TRAIN_VERTEX_LOCATION env inside worker")
+    parser.add_argument("--train_vertex_experiment_name", type=str, default="distilled-llm-train")
+    parser.add_argument("--train_vertex_run_name", type=str, default=None)
     parser.add_argument("--data_bin_dir", type=str, default="/tmp/vertex-bins", help="Directory to write the packed bin file")
     parser.add_argument("--data_bin_name", type=str, default="data.bin", help="Output packed bin file name")
     parser.add_argument("--block_size", type=int, default=512, help="Token block size for packing")
     parser.add_argument("--datasets_json", type=str, default=None, help="Dataset mixture JSON for scripts.loadDataset")
+    parser.add_argument(
+        "--metrics_prompts_json",
+        type=str,
+        default=None,
+        help="Prompt list JSON (file path or inline JSON) used when enable_metrics=1",
+    )
     parser.add_argument("--data_num_workers", type=int, default=None, help="Workers for dataset packing")
     parser.add_argument("--data_pack_batch_size", type=int, default=1024, help="Batch size for dataset packing tokenization")
     parser.add_argument("--tokenizer_model", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0", help="Tokenizer model name used in scripts.loadDataset")
+    parser.add_argument("--enable_bucket", "--enable-bucket", type=_parse_bool_flag, default=1, choices=[0, 1], help="Enable packed dataset cache sync with GCS")
+    parser.add_argument("--dataset_name", type=str, default="default", help="Dataset cache name for default GCS path datasets/{dataset_name}")
+    parser.add_argument("--bucket_dataset_path", type=str, default=None, help="Optional custom GCS path override for packed dataset cache")
 
     # Training hyperparameters passed via env -> scripts.train_vertex args defaults.
     parser.add_argument("--train_device", type=str, default="cuda")
@@ -77,6 +103,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_amp", type=int, default=1, choices=[0, 1])
     parser.add_argument("--amp_dtype", type=str, default="bfloat16")
     parser.add_argument("--enable_gradient_checkpointing", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--enable_metrics", type=int, default=0, choices=[0, 1])
+    parser.add_argument("--enable_vertex", "--enable-vertex", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--enable_tensorboard", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--tensorboard_hist_interval_steps", type=int, default=500)
     parser.add_argument("--total_steps", type=int, default=4000)
     parser.add_argument("--warmup_steps", type=int, default=400)
     parser.add_argument("--ckpt_interval_steps", type=int, default=500)
@@ -90,8 +120,8 @@ def _bucket_name(bucket_uri: str) -> str:
     return bucket_uri.replace("gs://", "").strip("/").split("/")[0]
 
 
-def _resolve_datasets_json_arg(value: str | None) -> str | None:
-    """Return a JSON string for DATASETS_JSON.
+def _resolve_json_arg(value: str | None) -> str | None:
+    """Return a JSON string for env payloads.
 
     If `value` points to a local file, inline file content so Vertex workers
     can parse it even when the original local path is unavailable.
@@ -161,12 +191,19 @@ def main() -> None:
             {"name": "LOCAL_CKPT_DIR", "value": args.local_ckpt_dir},
             {"name": "TRAIN_LOG_LEVEL", "value": args.train_log_level.upper()},
             {"name": "TRAIN_PROGRESS_BAR", "value": str(args.train_progress_bar)},
+            {"name": "TRAIN_VERTEX_PROJECT", "value": args.train_vertex_project or args.project_id},
+            {"name": "TRAIN_VERTEX_LOCATION", "value": args.train_vertex_location or args.region},
+            {"name": "TRAIN_VERTEX_EXPERIMENT_NAME", "value": args.train_vertex_experiment_name},
+            {"name": "TRAIN_VERTEX_RUN_NAME", "value": args.train_vertex_run_name or display_name},
             {"name": "NPROC_PER_NODE", "value": str(nproc_per_node)},
             {"name": "DATA_BIN_DIR", "value": args.data_bin_dir},
             {"name": "DATA_BIN_NAME", "value": args.data_bin_name},
             {"name": "BLOCK_SIZE", "value": str(args.block_size)},
             {"name": "DATA_PACK_BATCH_SIZE", "value": str(args.data_pack_batch_size)},
             {"name": "TOKENIZER_MODEL", "value": args.tokenizer_model},
+            {"name": "ENABLE_BUCKET", "value": str(args.enable_bucket)},
+            {"name": "BUCKET_URI", "value": args.bucket_uri},
+            {"name": "DATASET_NAME", "value": args.dataset_name},
             {"name": "TRAIN_DEVICE", "value": args.train_device},
             {"name": "TRAIN_SEED", "value": str(args.train_seed)},
             {"name": "TRAIN_NUM_WORKERS", "value": str(args.train_num_workers)},
@@ -187,6 +224,10 @@ def main() -> None:
             {"name": "TRAIN_USE_AMP", "value": str(args.use_amp)},
             {"name": "TRAIN_AMP_DTYPE", "value": args.amp_dtype},
             {"name": "TRAIN_ENABLE_GRADIENT_CHECKPOINTING", "value": str(args.enable_gradient_checkpointing)},
+            {"name": "TRAIN_ENABLE_METRICS", "value": str(args.enable_metrics)},
+            {"name": "TRAIN_ENABLE_VERTEX", "value": str(args.enable_vertex)},
+            {"name": "TRAIN_ENABLE_TENSORBOARD", "value": str(args.enable_tensorboard)},
+            {"name": "TRAIN_TENSORBOARD_HIST_INTERVAL_STEPS", "value": str(args.tensorboard_hist_interval_steps)},
             {"name": "TRAIN_TOTAL_STEPS", "value": str(args.total_steps)},
             {"name": "TRAIN_WARMUP_STEPS", "value": str(args.warmup_steps)},
             {"name": "TRAIN_CKPT_INTERVAL_STEPS", "value": str(args.ckpt_interval_steps)},
@@ -198,11 +239,16 @@ def main() -> None:
             {"name": "PIP_DISABLE_PIP_VERSION_CHECK", "value": "1"},
         ],
     }
-    datasets_json_value = _resolve_datasets_json_arg(args.datasets_json)
+    datasets_json_value = _resolve_json_arg(args.datasets_json)
     if datasets_json_value:
         python_package_spec["env"].append({"name": "DATASETS_JSON", "value": datasets_json_value})
+    metrics_prompts_value = _resolve_json_arg(args.metrics_prompts_json)
+    if metrics_prompts_value:
+        python_package_spec["env"].append({"name": "METRICS_PROMPTS_JSON", "value": metrics_prompts_value})
     if args.data_num_workers is not None:
         python_package_spec["env"].append({"name": "DATA_NUM_WORKERS", "value": str(args.data_num_workers)})
+    if args.bucket_dataset_path:
+        python_package_spec["env"].append({"name": "BUCKET_DATASET_PATH", "value": args.bucket_dataset_path})
 
     machine_spec = {"machine_type": args.machine_type}
     if accelerator_count > 0:

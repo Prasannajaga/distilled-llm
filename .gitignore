@@ -12,8 +12,8 @@ output/
 dist/
 data/
 test.py
-presets/
 *.bin
 *.idx
 test.py
 test.py
+transformers-model-486215-a2-8774b5cab7f9.json
