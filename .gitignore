@@ -17,3 +17,4 @@ test.py
 test.py
 test.py
 transformers-model-486215-a2-8774b5cab7f9.json
+scripts/verify_vertex_experiments.py

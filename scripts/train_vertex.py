@@ -93,6 +93,45 @@ def _env_bool(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _json_from_value(value: str | None):
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    source = raw
+    if os.path.exists(raw) and os.path.isfile(raw):
+        with open(raw, "r", encoding="utf-8") as fp:
+            source = fp.read()
+    return json.loads(source)
+
+
+def load_metrics_prompts(metrics_prompts_json: str | None) -> list[str]:
+    payload = _json_from_value(metrics_prompts_json)
+    if payload is None:
+        return []
+    if not isinstance(payload, list):
+        raise ValueError("metrics_prompts_json must be a JSON list.")
+
+    prompts: list[str] = []
+    for idx, item in enumerate(payload):
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                prompts.append(text)
+            continue
+        if isinstance(item, dict):
+            prompt = item.get("prompt")
+            if isinstance(prompt, str) and prompt.strip():
+                prompts.append(prompt.strip())
+                continue
+        raise ValueError(
+            f"Invalid prompt entry at index {idx}. "
+            "Use either a string or an object with {'prompt': '<text>'}."
+        )
+    return prompts
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train model on one packed binary file."
@@ -151,6 +190,40 @@ def parse_args() -> argparse.Namespace:
         choices=[0, 1],
         default=1 if _env_bool("TRAIN_ENABLE_GRADIENT_CHECKPOINTING", BASE_CONFIG.enable_gradient_checkpointing) else 0,
     )
+    parser.add_argument(
+        "--enable_metrics",
+        type=int,
+        choices=[0, 1],
+        default=1 if _env_bool("TRAIN_ENABLE_METRICS", BASE_CONFIG.enable_metrics) else 0,
+    )
+    parser.add_argument(
+        "--metrics_prompts_json",
+        type=str,
+        default=os.environ.get("METRICS_PROMPTS_JSON", None),
+        help="Prompts JSON (file path or inline JSON list) used for post-train metrics.",
+    )
+    parser.add_argument(
+        "--enable_vertex",
+        "--enable-vertex",
+        dest="enable_vertex",
+        type=int,
+        choices=[0, 1],
+        default=1 if _env_bool("TRAIN_ENABLE_VERTEX", BASE_CONFIG.enable_vertex_tracking) else 0,
+    )
+    parser.add_argument(
+        "--enable_tensorboard",
+        type=int,
+        choices=[0, 1],
+        default=1 if _env_bool("TRAIN_ENABLE_TENSORBOARD", BASE_CONFIG.enable_tensorboard) else 0,
+    )
+    parser.add_argument(
+        "--tensorboard_hist_interval_steps",
+        type=int,
+        default=_env_int(
+            "TRAIN_TENSORBOARD_HIST_INTERVAL_STEPS",
+            BASE_CONFIG.tensorboard_hist_interval_steps,
+        ),
+    )
 
     parser.add_argument("--total_steps", type=int, default=_env_int("TRAIN_TOTAL_STEPS", BASE_CONFIG.total_steps))
     parser.add_argument("--warmup_steps", type=int, default=_env_int("TRAIN_WARMUP_STEPS", BASE_CONFIG.warmup_steps))
@@ -203,6 +276,10 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     cfg.use_amp = bool(args.use_amp)
     cfg.amp_dtype = args.amp_dtype
     cfg.enable_gradient_checkpointing = bool(args.enable_gradient_checkpointing)
+    cfg.enable_metrics = bool(args.enable_metrics)
+    cfg.enable_vertex_tracking = bool(args.enable_vertex)
+    cfg.enable_tensorboard = bool(args.enable_tensorboard)
+    cfg.tensorboard_hist_interval_steps = int(args.tensorboard_hist_interval_steps)
 
     cfg.total_steps = int(args.total_steps)
     cfg.warmup_steps = int(args.warmup_steps)
@@ -377,16 +454,37 @@ def upload_auxiliary_artifacts(local_ckpt_dir: str, bucket_name: str, prefix: st
         "spiece.model",
         "sentencepiece.bpe.model",
     }
+
+    def _maybe_upload(local_path: str, relative_path: str):
+        if relative_path in uploaded:
+            return
+        gcs_blob_path = os.path.join(prefix, relative_path)
+        save_checkpoint_bucket(local_path, bucket_name, gcs_blob_path)
+        uploaded.add(relative_path)
+
     for fname in os.listdir(local_ckpt_dir):
         local_path = os.path.join(local_ckpt_dir, fname)
         if not os.path.isfile(local_path):
             continue
-        if fname in uploaded:
-            continue
         if fname in allowlist or fname.startswith("tokenizer"):
-            gcs_blob_path = os.path.join(prefix, fname)
-            save_checkpoint_bucket(local_path, bucket_name, gcs_blob_path)
-            uploaded.add(fname)
+            _maybe_upload(local_path, fname)
+
+    for subdir in ("logs", "metrics"):
+        subdir_path = os.path.join(local_ckpt_dir, subdir)
+        if not os.path.isdir(subdir_path):
+            continue
+        for root, _, files in os.walk(subdir_path):
+            for fname in files:
+                local_path = os.path.join(root, fname)
+                rel_path = os.path.relpath(local_path, local_ckpt_dir)
+                if not (
+                    fname.endswith(".json")
+                    or fname.endswith(".jsonl")
+                    or fname.endswith(".log")
+                    or "tfevents" in fname
+                ):
+                    continue
+                _maybe_upload(local_path, rel_path)
 
 
 def upload_model_bundle(
@@ -408,6 +506,28 @@ def upload_model_bundle(
         else:
             LOGGER.warning("Results file not found for bundle upload: %s", results_file)
     upload_auxiliary_artifacts(local_ckpt_dir, bucket_name, prefix, uploaded=set())
+
+
+def upload_explicit_artifacts(
+    local_ckpt_dir: str,
+    bucket_name: str,
+    prefix: str,
+    artifact_paths: list[str | None],
+):
+    for raw_path in artifact_paths:
+        if not raw_path:
+            continue
+        local_path = os.path.abspath(raw_path)
+        if not os.path.isfile(local_path):
+            LOGGER.warning("Artifact path missing or not a file: %s", local_path)
+            continue
+        try:
+            rel = os.path.relpath(local_path, local_ckpt_dir)
+            if rel.startswith(".."):
+                rel = os.path.basename(local_path)
+        except Exception:
+            rel = os.path.basename(local_path)
+        save_checkpoint_bucket(local_path, bucket_name, os.path.join(prefix, rel))
 
 
 def setup_distributed():
@@ -529,12 +649,20 @@ def main():
     rank = 0
     world_size = 1
     local_rank = 0
+    trainer = None
 
     try:
         with log_stage("distributed_setup"):
             is_distributed, rank, world_size, local_rank = setup_distributed()
 
         is_main = rank == 0
+        LOGGER.info(
+            "rank_heartbeat rank=%s local_rank=%s world_size=%s pid=%s",
+            rank,
+            local_rank,
+            world_size,
+            os.getpid(),
+        )
 
         if not is_main:
             logging.getLogger().setLevel(logging.ERROR)
@@ -561,6 +689,8 @@ def main():
                 train_batch_size=config.train_batch_size,
                 eval_batch_size=config.eval_batch_size,
                 lr=config.lr,
+                enable_metrics=config.enable_metrics,
+                enable_vertex_tracking=config.enable_vertex_tracking,
             ),
         )
 
@@ -569,12 +699,39 @@ def main():
         else:
             device = get_device(config.device)
         LOGGER.info("device=%s", device)
+        visible_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if is_main:
+            if visible_gpus > 1 and not is_distributed:
+                LOGGER.warning(
+                    "multi_gpu_visible_but_not_distributed visible_gpus=%s world_size=%s",
+                    visible_gpus,
+                    world_size,
+                )
+            if is_distributed and visible_gpus > 0 and world_size != visible_gpus:
+                LOGGER.warning(
+                    "world_size_gpu_mismatch visible_gpus=%s world_size=%s",
+                    visible_gpus,
+                    world_size,
+                )
 
         bin_path = os.path.abspath(args.bin_path)
         LOGGER.info("dataset bin_path=%s", bin_path)
 
         with log_stage("tokenizer_load", model=TINYLLAMA_MODEL_NAME):
             tokenizer = load_tokenizer(TINYLLAMA_MODEL_NAME)
+
+        metrics_prompts: list[str] = []
+        if config.enable_metrics:
+            with log_stage("metrics_prompts_load"):
+                try:
+                    metrics_prompts = load_metrics_prompts(args.metrics_prompts_json)
+                    LOGGER.info("metrics_prompts=count %s", len(metrics_prompts))
+                    if len(metrics_prompts) == 0 and is_main:
+                        LOGGER.warning("metrics=enabled but no prompts were provided")
+                except Exception:
+                    LOGGER.exception("metrics_prompts_load=failed; continuing without end-of-run eval metrics")
+                    metrics_prompts = []
+                    config.enable_metrics = False
 
         with log_stage("dataloader_build", bin_path=bin_path):
             with capture_prints(level=logging.INFO, prefix="[data] "):
@@ -606,9 +763,10 @@ def main():
                 device=device,
                 tokenizer=tokenizer,
                 ckpt_dir=config.ckpt_dir,
+                prompts=metrics_prompts if is_main else None,
             )
 
-        if is_main and AIP_CHECKPOINT_DIR:
+        if is_main and config.enable_vertex_tracking and AIP_CHECKPOINT_DIR:
             with log_stage("checkpoint_patch", gcs_dir=AIP_CHECKPOINT_DIR):
                 patch_trainer_checkpointing(trainer, AIP_CHECKPOINT_DIR)
 
@@ -630,9 +788,18 @@ def main():
 
         final_ckpt = None
         results_json_path = None
+        prompt_metrics_path = None
         if is_main and trainer.ckpt_dir:
             with log_stage("final_checkpoint_save", step=trainer.global_step):
                 final_ckpt = trainer.save_final_checkpoint(step=trainer.global_step)
+
+        if is_main and config.enable_metrics and len(metrics_prompts) > 0:
+            with log_stage("metrics_eval", prompts=len(metrics_prompts)):
+                try:
+                    prompt_metrics_path = trainer.save_prompt_metrics(prompts=metrics_prompts)
+                except Exception:
+                    LOGGER.exception("metrics_eval=failed; continuing without prompt metrics artifact")
+                    prompt_metrics_path = None
 
         if is_main:
             with log_stage("results_save", ckpt_dir=config.ckpt_dir):
@@ -676,23 +843,27 @@ def main():
                         "packed_total_tokens": summary_total_tokens,
                     },
                     "vertex": {
+                        "enabled": bool(config.enable_vertex_tracking),
                         "aip_model_dir": AIP_MODEL_DIR,
                         "aip_checkpoint_dir": AIP_CHECKPOINT_DIR,
                         "rank": rank,
                         "local_rank": local_rank,
                         "world_size": world_size,
                         "is_distributed": is_distributed,
+                        "experiment_events_path": trainer.vertex_event_path,
                     },
                     "artifacts": {
                         "ckpt_dir": config.ckpt_dir,
                         "final_checkpoint_path": final_ckpt,
                         "step_metrics_path": trainer.step_metrics_path,
+                        "tensorboard_dir": trainer.tensorboard_dir,
+                        "prompt_metrics_path": prompt_metrics_path,
                     },
                 }
                 results_json_path = trainer.save_results_json(extra=results_extra)
                 LOGGER.info("results=written path=%s", results_json_path)
 
-        if is_main and AIP_MODEL_DIR:
+        if is_main and config.enable_vertex_tracking and AIP_MODEL_DIR:
             with log_stage("final_model_upload", target=AIP_MODEL_DIR):
                 bucket_name, prefix = parse_gcs_uri(AIP_MODEL_DIR)
                 if bucket_name:
@@ -709,12 +880,38 @@ def main():
                         checkpoint_file=final_ckpt,
                         results_file=results_json_path,
                     )
-        elif is_main and AIP_CHECKPOINT_DIR and results_json_path:
+                    upload_explicit_artifacts(
+                        local_ckpt_dir=config.ckpt_dir,
+                        bucket_name=bucket_name,
+                        prefix=prefix,
+                        artifact_paths=[
+                            prompt_metrics_path,
+                            trainer.step_metrics_path,
+                            trainer.vertex_event_path,
+                        ],
+                    )
+        elif is_main and config.enable_vertex_tracking and AIP_CHECKPOINT_DIR and results_json_path:
             with log_stage("results_upload", target=AIP_CHECKPOINT_DIR):
                 bucket_name, prefix = parse_gcs_uri(AIP_CHECKPOINT_DIR)
                 if bucket_name:
                     gcs_blob_path = os.path.join(prefix, os.path.basename(results_json_path))
                     save_checkpoint_bucket(results_json_path, bucket_name, gcs_blob_path)
+                    upload_auxiliary_artifacts(
+                        local_ckpt_dir=config.ckpt_dir,
+                        bucket_name=bucket_name,
+                        prefix=prefix,
+                        uploaded={os.path.basename(results_json_path)},
+                    )
+                    upload_explicit_artifacts(
+                        local_ckpt_dir=config.ckpt_dir,
+                        bucket_name=bucket_name,
+                        prefix=prefix,
+                        artifact_paths=[
+                            prompt_metrics_path,
+                            trainer.step_metrics_path,
+                            trainer.vertex_event_path,
+                        ],
+                    )
 
         LOGGER.info(
             "run=complete %s",
@@ -723,9 +920,15 @@ def main():
                 best_train_loss=f"{trainer._best_train_loss:.4f}" if trainer._best_train_loss != float("inf") else None,
                 best_val_loss=f"{trainer._best_val_loss:.4f}" if trainer._best_val_loss != float("inf") else None,
                 results_json=results_json_path,
+                prompt_metrics=prompt_metrics_path,
             ),
         )
-    except Exception:
+    except Exception as exc:
+        if trainer is not None:
+            try:
+                trainer.finalize_vertex_tracking(status="failed", error=str(exc))
+            except Exception:
+                LOGGER.exception("Failed to finalize vertex tracking after fatal error")
         LOGGER.exception("run=fatal")
         raise
     finally:

@@ -58,6 +58,12 @@ class TrainingConfig:
     log_interval_steps: int = 500
     log_per_iteration_time: bool = False
 
+    # Experiment tracking and post-train prompt metrics
+    enable_vertex_tracking: bool = True
+    enable_metrics: bool = False
+    enable_tensorboard: bool = True
+    tensorboard_hist_interval_steps: int = 500
+
     # Inference config here 
     max_new_tokens: int = 512
     temperature: float = 0.7

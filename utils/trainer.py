@@ -15,7 +15,7 @@ import traceback
 from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
-from typing import Optional, Any, Dict 
+from typing import Optional, Any, Dict
 import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -23,6 +23,8 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from utils.config import TrainingConfig
 from utils.config_io import save_config_json
+from utils.eval_metrics import EvalMetrics
+from utils.vertexExperiments import VertexExperiments
 
 SUPPORTED_OPTIMIZERS = frozenset({"adamw", "adam", "sgd", "adafactor"})
 
@@ -42,6 +44,8 @@ class Trainer:
         self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.tokenizer = tokenizer
         self.prompts = list(prompts or [])
+        self.enable_vertex_tracking = bool(getattr(self.config, "enable_vertex_tracking", True))
+        self.enable_metrics = bool(getattr(self.config, "enable_metrics", False))
         self.show_progress_bar = os.environ.get("TRAIN_PROGRESS_BAR", "0") == "1"
         # checkpoint directory precedence: explicit arg > config.ckpt_dir
         self.ckpt_dir = ckpt_dir or config.ckpt_dir
@@ -49,14 +53,22 @@ class Trainer:
         self.metrics_dir: Optional[str] = None
         self.log_file_path: Optional[str] = None
         self.step_metrics_path: Optional[str] = None
+        self.vertex_event_path: Optional[str] = None
+        self.tensorboard_dir: Optional[str] = None
+        self.vertex_experiments: Optional[VertexExperiments] = None
         if self.ckpt_dir:
             os.makedirs(self.ckpt_dir, exist_ok=True)
             self.logs_dir = os.path.join(self.ckpt_dir, "logs")
             os.makedirs(self.logs_dir, exist_ok=True)
             timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
             self.log_file_path = os.path.join(self.logs_dir, f"trainer_{timestamp}.log")
-            self.step_metrics_path = os.path.join(self.logs_dir, f"trainer_steps_{timestamp}.jsonl")
-            if len(self.prompts) > 0:
+            if self.enable_vertex_tracking:
+                self.step_metrics_path = os.path.join(self.logs_dir, f"trainer_steps_{timestamp}.jsonl")
+                self.vertex_event_path = os.path.join(self.logs_dir, f"vertex_events_{timestamp}.jsonl")
+            if bool(getattr(self.config, "enable_tensorboard", True)):
+                self.tensorboard_dir = os.path.join(self.logs_dir, "tensorboard")
+                os.makedirs(self.tensorboard_dir, exist_ok=True)
+            if self.enable_metrics or len(self.prompts) > 0:
                 self.metrics_dir = os.path.join(self.ckpt_dir, "metrics")
                 os.makedirs(self.metrics_dir, exist_ok=True)
 
@@ -115,6 +127,7 @@ class Trainer:
         # Log initialization info
         if self.config.enable_logging:
             self._log_init_info()
+        self._init_vertex_tracking()
 
     def _log(self, message: str):
         if self.config.enable_logging:
@@ -147,6 +160,55 @@ class Trainer:
             return True
         import torch.distributed as dist
         return dist.get_rank() == 0
+
+    def _track_vertex_event(self, event: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        if self.vertex_experiments is None:
+            return
+        self.vertex_experiments.track_event(event, payload or {}, global_step=self.global_step)
+
+    def _init_vertex_tracking(self) -> None:
+        if not self._is_main_process():
+            return
+        enable_tensorboard = bool(getattr(self.config, "enable_tensorboard", True))
+        if not self.enable_vertex_tracking and not enable_tensorboard:
+            return
+        self.vertex_experiments = VertexExperiments(
+            enabled=self.enable_vertex_tracking,
+            is_main_process=True,
+            event_path=self.vertex_event_path,
+            tensorboard_dir=self.tensorboard_dir,
+            enable_tensorboard=enable_tensorboard,
+            tensorboard_hist_interval_steps=int(
+                getattr(self.config, "tensorboard_hist_interval_steps", 0) or 0
+            ),
+            run_config=asdict(self.config),
+            log_interval_steps=int(getattr(self.config, "log_interval_steps", 0) or 0),
+            logger=self._log,
+            log_exception=self._log_exception,
+        )
+        self.vertex_experiments.start(
+            global_step=self.global_step,
+            device=str(self.device),
+            world_size=self._get_world_size(),
+            enable_metrics=bool(self.enable_metrics),
+        )
+
+    def _log_vertex_sdk_metrics(self, metrics: Dict[str, float], step: int, force: bool = False) -> None:
+        if self.vertex_experiments is None:
+            return
+        self.vertex_experiments.log_metrics(metrics=metrics, step=step, force=force)
+
+    def finalize_vertex_tracking(self, status: str = "completed", error: Optional[str] = None) -> None:
+        if self.vertex_experiments is not None:
+            self.vertex_experiments.finalize(
+                status=status,
+                error=error,
+                global_step=self.global_step,
+                best_train_loss=self._clean_metric(self._best_train_loss, invalid=float("inf")),
+                best_val_loss=self._clean_metric(self._best_val_loss, invalid=float("inf")),
+                final_train_loss=self._clean_metric(self._final_train_loss, invalid=float("inf")),
+                final_val_loss=self._clean_metric(self._final_val_loss, invalid=float("inf")),
+            )
 
     def _unwrap_model(self) -> nn.Module:
         return self.model.module if isinstance(self.model, DDP) else self.model
@@ -386,6 +448,28 @@ class Trainer:
                 fp.write(json.dumps(payload) + "\n")
         except Exception:
             pass
+        self._track_vertex_event("step_metrics", payload)
+        metrics_for_vertex = {
+            "train_loss": float(train_loss),
+            "lr": float(lr),
+        }
+        if grad_norm is not None:
+            metrics_for_vertex["grad_norm"] = float(grad_norm)
+        if val_loss is not None:
+            metrics_for_vertex["val_loss"] = float(val_loss)
+        self._log_vertex_sdk_metrics(metrics_for_vertex, step=step)
+        if self.vertex_experiments is not None:
+            memory_summary = self.get_memory_summary() if self.device.type == "cuda" else {}
+            self.vertex_experiments.log_tensorboard_step(
+                step=step,
+                train_loss=train_loss,
+                lr=lr,
+                grad_norm=grad_norm,
+                val_loss=val_loss,
+                iter_time_s=iter_time_s,
+                model=self._unwrap_model(),
+                memory_summary=memory_summary,
+            )
 
     def _generate_training_metadata(self, checkpoint_path: str) -> Dict[str, Any]:
         params = self.parameter_counts()
@@ -560,6 +644,73 @@ class Trainer:
         payload = self.build_results_payload(extra=extra)
         self._save_metadata_atomically(payload, path)
         self._log(f"[Trainer] Saved results: {path}")
+        self._track_vertex_event(
+            "results_saved",
+            {
+                "path": os.path.abspath(path),
+                "schema_version": payload.get("schema_version"),
+            },
+        )
+        return path
+
+    def save_prompt_metrics(
+        self,
+        prompts: Optional[list[str]] = None,
+        path: Optional[str] = None,
+        max_new_tokens: Optional[int] = None,
+    ) -> Optional[str]:
+        prompts = list(prompts or self.prompts)
+        if len(prompts) == 0:
+            self._log("[Trainer] Prompt metrics skipped: no prompts provided")
+            return None
+        if self.tokenizer is None:
+            self._log("[Trainer] Prompt metrics skipped: tokenizer missing")
+            return None
+
+        if path is None:
+            base_dir = self.metrics_dir or self.ckpt_dir or os.getcwd()
+            os.makedirs(base_dir, exist_ok=True)
+            path = os.path.join(base_dir, f"prompt_metrics_step_{self.global_step}.json")
+
+        use_top_k = bool(getattr(self.config, "use_top_k", True))
+        top_k = int(getattr(self.config, "top_k", 50)) if use_top_k else None
+        use_repetition_penalty = bool(getattr(self.config, "use_repetition_penalty", True))
+        repetition_penalty = (
+            float(getattr(self.config, "repetition_penalty", 1.2))
+            if use_repetition_penalty
+            else 1.0
+        )
+        temperature = float(getattr(self.config, "temperature", 0.7))
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if max_new_tokens is None:
+            max_new_tokens = int(getattr(self.config, "max_new_tokens", 128))
+
+        evaluator = EvalMetrics(
+            prompts=prompts,
+            model=self._unwrap_model(),
+            tokenizer=self.tokenizer,
+            device=self.device,
+            use_amp=self.use_amp,
+            amp_dtype=self.amp_dtype,
+            max_new_tokens=int(max_new_tokens),
+            temperature=temperature,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            eos_token_id=eos_token_id,
+        )
+        payload = evaluator.run(global_step=self.global_step)
+        successful = int(payload.get("summary", {}).get("success_count", 0))
+        
+        self._save_metadata_atomically(payload, path)
+        self._log(f"[Trainer] Saved prompt metrics: {path}")
+        self._track_vertex_event(
+            "prompt_metrics_saved",
+            {
+                "path": os.path.abspath(path),
+                "prompt_count": len(prompts),
+                "success_count": successful,
+            },
+        )
         return path
   
     def save_checkpoint(
@@ -617,6 +768,14 @@ class Trainer:
                 payload["scaler_state_dict"] = None
         torch.save(payload, path)
         self._log(f"[Trainer] Saved checkpoint: {path}")
+        self._track_vertex_event(
+            "checkpoint_saved",
+            {
+                "path": os.path.abspath(path),
+                "step": int(step),
+                "include_optimizer_state": bool(include_optimizer_state),
+            },
+        )
         return path 
 
     def save_final_checkpoint(self, step: Optional[int] = None, prefix: str = "final_ckpt") -> str:
@@ -952,6 +1111,7 @@ class Trainer:
         if self.device.type == "cuda":
             mem = self.get_memory_summary()
             self._log(f"[Trainer] Peak GPU memory: {mem['peak_gb']:.2f}GB")
+        self.finalize_vertex_tracking(status="completed")
         
  
 
@@ -1156,6 +1316,7 @@ class Trainer:
             if self.device.type == "cuda":
                 mem = self.get_memory_summary()
                 self._log(f"[Trainer] Peak GPU memory: {mem['peak_gb']:.2f}GB")
+            self.finalize_vertex_tracking(status="completed")
             
     def state_dict(self) -> Dict[str, Any]: 
         state = {
