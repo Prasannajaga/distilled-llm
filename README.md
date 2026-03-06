@@ -14,60 +14,26 @@ For detailed journey notes and deployment history:
 
 ## Project Architecture
 
-At a high level, the repo is split into 4 layers.
-
-### 1) Model layer
-
-- `scripts/model.py`
-- `utils/transformer.py`
-
-Contains:
-
-- GQA + RoPE attention blocks
-- RMSNorm + SwiGLU FFN
-- KV-cache aware generation
-- recent optimizations (QK normalization, FFN alignment)
-
-### 2) Data layer
-
-- `utils/packed_dataset_builder.py`
-- `scripts/loadDataset.py` (called in pipeline)
-- `Cdatasets/*`
-
-Flow:
-
-1. load HF dataset(s)
-2. tokenize
-3. pack into fixed block-size chunks
-4. save packed bin/index
-5. memory-map for training dataloaders
-
-### 3) Training layer
-
-- `utils/trainer.py`
-- `scripts/train_pretrain.py`
-- `scripts/train_distill.py`
-- `scripts/train_vertex.py`
-
-Covers:
-
-- mixed precision
-- gradient accumulation
-- checkpoint/resume
-- optional distributed training (DDP)
-- Vertex experiment hooks/logging
-
-### 4) Deployment/ops layer
-
-- `deploy.py`
-- `scripts/step-train.sh`
-- `scripts/run_step_train.py`
-
-Covers:
-
-- package + upload source dist
-- submit Vertex custom job
-- run worker-side data packing then training
+```text
+.
+├── deploy.py                 # Vertex submission entrypoint
+├── presets/                  # Preconfigured deployment and training templates
+├── scripts/                  # Executable training and inference scripts
+│   ├── infer.py              # Local inference testing
+│   ├── loadDataset.py        # Dataset loading & manipulation
+│   ├── model.py              # Model definitions and KV-cache aware generation
+│   ├── run_step_train.py     # Worker-side execution wrapper
+│   ├── step-train.sh         # Worker pipeline entry
+│   ├── train_distill.py      # Distillation training loop
+│   ├── train_pretrain.py     # Pretraining loop
+│   └── train_vertex.py       # Vertex AI training wrapper
+└── utils/                    # Core utilities and modules
+    ├── config.py             # Shared project configurations
+    ├── engine.py             # Inference/generation engine
+    ├── packed_dataset_builder.py  # Data packing logic
+    ├── trainer.py            # Main training loop and checkpointing
+    └── transformer.py        # Transformer primitives (GQA, RMSNorm, etc.)
+```
 
 ## Simple Usage
 
@@ -103,18 +69,3 @@ python deploy.py \
 ```bash
 bash scripts/step-train.sh --epochs 1 --total_steps 100
 ```
-
-## Key Files to Start With
-
-- `scripts/model.py`: model architecture and generation
-- `utils/transformer.py`: attention/FFN/norm primitives
-- `utils/trainer.py`: train loop + checkpointing
-- `deploy.py`: Vertex submission entrypoint
-- `scripts/step-train.sh`: worker-side step pipeline
-
-## Notes
-
-- Keep `block_size` consistent across packing and training.
-- For large dataset packing on Vertex, disk sizing matters a lot.
-- For deeper progress details, read [progress.md](./progress.md).
-- For failures/fixes during deployment, read [deploy.md](./deploy.md).
