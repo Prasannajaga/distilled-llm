@@ -1,25 +1,80 @@
-# Deployment Notes (Last 2 Days)
-
-This document captures the deployment flow we followed, what failed, how we fixed it, and the CLI commands used.
-
-## Quick Summary
-
-In the last 2 days, we moved from basic script-level training to a repeatable Vertex AI pipeline:
+## Quick Deployment Summary
 
 1. package project
 2. submit Vertex custom job
 3. run dataset packing in worker
 4. run DDP training
-5. save checkpoints locally and sync artifacts to GCS
+5. save checkpoints locally and sync artifacts to GCS 
 
-Key progress commits in this window:
+## High-level diagram
 
-- `batch scripts installation`
-- `model enhancement`
-- `deploy vertex setup`
-- `presets update`
+```mermaid
+flowchart TD
+  A[Local Machine] --> B[deploy.py]
+  B --> C[Build package<br/>setup.py sdist]
+  C --> D[GCS Packages<br/>gs://bucket/packages/*.tar.gz]
+  B --> E[Submit Vertex CustomJob<br/>worker spec + env]
 
-## Deployment Flow We Used
+  E --> F[Vertex Worker GPU VM]
+  D --> F
+  F --> G[scripts.run_step_train]
+  G --> H[step-train.sh]
+  H --> I[Step 1: scripts.loadDataset]
+  I --> J[Packed bin<br/>/tmp/vertex-bins/data.bin]
+  I --> K[Optional dataset cache<br/>gs://bucket/datasets/...]
+  H --> L[Step 2: torch.distributed.run]
+  L --> M[scripts.train_vertex DDP]
+  M --> N[Local checkpoints<br/>/outputs/mini-code-v1]
+  M --> O[Vertex logs/artifacts<br/>gs://bucket/training_logs]
+  M --> P[Vertex Experiment + TensorBoard metrics]
+```
+
+### Control plane vs data plane
+
+1. Control plane (`deploy.py`):
+
+   - Parses CLI/`@args` inputs.
+   - Builds + uploads the Python source distribution.
+   - Creates `python_package_spec` (image, module, env vars).
+   - Submits `aiplatform.CustomJob(...).run(...)`.
+2. Data plane (`scripts/step-train.sh` inside worker):
+
+   - Materializes packed data (`scripts.loadDataset`).
+   - Launches DDP training (`torch.distributed.run` -> `scripts.train_vertex`).
+   - Produces checkpoints, logs, and run metrics.
+
+### Where each thing goes
+
+- Source package:
+  - Built locally in `dist/*.tar.gz`.
+  - Uploaded to `gs://<bucket>/packages/<tarball>`.
+- Packed dataset bin:
+  - Created on worker disk at `DATA_BIN_DIR/DATA_BIN_NAME` (default `/tmp/vertex-bins/data.bin`).
+  - Optional bucket cache enabled with `ENABLE_BUCKET=1` and bucket path controls (`DATASET_NAME` / `BUCKET_DATASET_PATH`).
+- Training checkpoints/artifacts:
+  - Local worker path from `LOCAL_CKPT_DIR` (default `/outputs/mini-code-v1`).
+  - Vertex job artifacts and logs under `base_output_dir` (default `gs://<bucket>/training_logs`).
+- Experiment metadata:
+  - Vertex experiment/run naming via `TRAIN_VERTEX_EXPERIMENT_NAME` and `TRAIN_VERTEX_RUN_NAME`.
+  - TensorBoard + Vertex metric publishing controlled by `TRAIN_ENABLE_TENSORBOARD` and `TRAIN_ENABLE_VERTEX`.
+
+### Runtime sequence in detail
+
+1. `deploy.py` builds the package using `setup.py sdist --formats=gztar`.
+2. It uploads the latest tarball to GCS under `packages/`.
+3. It submits a Vertex `CustomJob` with:
+   - worker machine spec (CPU/GPU/replicas/disk),
+   - executor image (`--train_image`),
+   - module entrypoint (`--train_module`, default `scripts.run_step_train`),
+   - env vars for dataset packing + training hyperparameters.
+4. Vertex starts worker VM(s), installs the uploaded package, and runs the module.
+5. `scripts/step-train.sh` prints machine specs and storage state.
+6. Step 1 (`scripts.loadDataset`) packs tokenized samples into one `.bin` file.
+7. Step 2 starts distributed training with `torch.distributed.run` and `NPROC_PER_NODE`.
+8. `scripts.train_vertex` trains, evaluates, logs metrics, and saves periodic checkpoints.
+9. Job ends; artifacts remain in configured local/GCS outputs and are visible in Vertex job history.
+
+## Deployment Flow Used
 
 ### 1) Build + upload package + submit Vertex job
 
@@ -45,120 +100,9 @@ python deploy.py \
 
 ### 2) Worker entrypoint pipeline
 
-Inside Vertex worker, `scripts/step-train.sh` runs:
+Inside Vertex worker, `scripts/step-train.sh` runs:  
 
 ```bash
 python -m scripts.loadDataset ...
 python -m torch.distributed.run --nproc_per_node=<N> --module scripts.train_vertex --bin_path <packed_bin>
 ```
-
-### 3) Data packing defaults used
-
-Important env/defaults in `scripts/step-train.sh`:
-
-- `DATA_BIN_DIR=/tmp/vertex-bins`
-- `DATA_BIN_NAME=data.bin`
-- `BLOCK_SIZE=512`
-- `DATA_PACK_BATCH_SIZE=1024`
-- `DATA_NUM_WORKERS=$(nproc)`
-- `TOKENIZER_MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0`
-- `NPROC_PER_NODE=${WORLD_SIZE:-1}`
-
-## Failures We Faced and How We Fixed Them
-
-### Failure 1: Disk pressure during packing
-
-Symptom:
-
-- dataset mixture and intermediate packing consumed very high disk quickly.
-
-Fix:
-
-- increased boot disk (`--boot_disk_size 300`)
-- used packed `.bin` flow instead of repeated raw-tokenization every time
-- added bucket-aware dataset cache flags (`ENABLE_BUCKET`, `DATASET_NAME`, `BUCKET_DATASET_PATH`) to avoid unnecessary rebuilds.
-
-### Failure 2: DDP process/GPU mismatch
-
-Symptom:
-
-- unstable distributed startup or poor utilization when process count did not match GPU count.
-
-Fix:
-
-- set `--nproc_per_node` to accelerator count
-- propagated this through deploy env and `torch.distributed.run` call.
-
-### Failure 3: Noisy logs looked like hard errors
-
-Symptom:
-
-- pip and warning noise in Vertex logs made triage harder.
-
-Fix:
-
-- set envs in job spec to suppress noisy pip warnings:
-  - `PIP_NO_WARN_SCRIPT_LOCATION=1`
-  - `PIP_ROOT_USER_ACTION=ignore`
-  - `PIP_DISABLE_PIP_VERSION_CHECK=1`
-
-### Failure 4: Slow restart loop after interruption
-
-Symptom:
-
-- interrupted runs had expensive restart time.
-
-Fix:
-
-- checkpoint/resume flow used in trainer
-- optimizer/scaler persisted for resume checkpoints
-- final checkpoint can be lighter when full optimizer state is not required.
-
-### Failure 5: Data stage dominated training wall-clock
-
-Symptom:
-
-- tokenization + packing took longer than expected compared to pure training.
-
-Fix:
-
-- standardized pipeline: dataset -> tokenize -> pack -> mmap -> dataloader
-- made the data build step explicit in deployment pipeline.
-
-## Most Useful CLI Snippets
-
-### Submit with args file
-
-```bash
-python deploy.py @deploy.args
-```
-
-### Force non-default dataset JSON
-
-```bash
-python deploy.py \
-  --project_id <gcp-project> \
-  --region us-central1 \
-  --bucket_uri gs://<bucket> \
-  --datasets_json ./datasets.json
-```
-
-### Local dry run of worker pipeline
-
-```bash
-bash scripts/step-train.sh --epochs 1 --total_steps 50
-```
-
-### Manual train module run
-
-```bash
-python -m scripts.train_vertex --bin_path /tmp/vertex-bins/data.bin
-```
-
-## What Moved Us Forward
-
-- standardized packaging + submission in one command (`deploy.py`)
-- reliable worker pipeline (`scripts/step-train.sh`)
-- explicit resource sizing for large corpora
-- resumable training and cleaner logs
-- better observability separation (training logic vs experiment logging)

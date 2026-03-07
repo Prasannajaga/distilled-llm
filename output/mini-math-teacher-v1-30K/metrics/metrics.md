@@ -1,10 +1,6 @@
 # Metrics Summary: mini-math-teacher-v1-30K
 
-Folder: `/home/prasanna/coding/distilled-llm/output/mini-math-teacher-v1-30K/metrics`
-Source files:
-- `final_ckpt_30000.json`
-- `results.json`
-- `metrics_prompt_metrics_step_30000.json`
+ 
 
 ## 1) Quick Snapshot
 
@@ -110,12 +106,4 @@ Visualization:
 - Inference reliability is high (25/25 requests succeeded).
 - Output quality appears inconsistent: multiple completions are off-task or drift from the prompt intent.
 - High cap-hit rate suggests frequent non-natural stopping (responses often run to limit).
-
-## 6) Consistency Checks
-
-- Core run/loss values match between `final_ckpt_30000.json` and `results.json`.
-- Artifact paths in `results.json` point to `/outputs/mini-code-v1/...` while this run directory is `mini-math-teacher-v1-30K`; likely naming/path carryover.
-
-## 7) Bottom Line
-
-Training infrastructure metrics look healthy and the run completed fully. Prompt-based evaluation indicates a quality gap (instruction following/content relevance) despite successful generation calls.
+  

@@ -1,21 +1,9 @@
----
-language:
-- en
-license: mit
-tags:
-- causal-lm
-- transformer
-- gqa
-- math
-- instruction-following
-library_name: pytorch
-pipeline_tag: text-generation
-model_name: mini-math-teacher-v1-base-30K
----
-
 # mini-math-teacher-v1-base-30K
 
 `mini-math-teacher-v1-base-30K` is a 146.8M-parameter causal language model checkpoint trained for 30k steps with a GQA-based transformer architecture.
+
+`base model:` model.safetensors
+`checkpoint model:` checkpoints_model_30000.safetensors (resume training from this optimizer & scaler)
 
 ## Model Details
 

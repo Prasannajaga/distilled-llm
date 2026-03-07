@@ -69,3 +69,16 @@ python deploy.py \
 ```bash
 bash scripts/step-train.sh --epochs 1 --total_steps 100
 ```
+
+## Teacher Training
+
+Reference run: `mini-math-teacher-v1-30K`  
+Full report: [output/mini-math-teacher-v1-30K/metrics/metrics.md](./output/mini-math-teacher-v1-30K/metrics/metrics.md)  
+
+### Dataset Mix (Rows)
+
+| Dataset | Share |
+|---|---:|
+| HuggingFaceFW/fineweb (`sample-10BT`) | 56.75% |
+| open-web-math/open-web-math | 42.85% |
+| incredible45/Gutenberg-BookCorpus-Cleaned-Data-English | 0.40% |

@@ -23,3 +23,5 @@ output/mini-math-S3/
 output/mini-math-S4/
 output/mini-math-student/ 
 output/mini-math-t3/
+output/mini-math-teacher-v1-30K/checkpoints_model_30000.safetensors
+output/mini-math-teacher-v1-30K/model.safetensors
