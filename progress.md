@@ -1,80 +1,59 @@
 # Purpose
 
-I developed this model solely to understand the in-depth knowledge of how distillation works between a teacher and student model.
+I built this model to deeply understand how distillation works between teacher and student models.
 
 # Scope
 
-What is the scope of training this from scrath?
+After training an autoregressive model on TinyStories, I wanted to go further. I moved to a math-reasoning model trained on selected subsets of `math-ai/AutoMathText`:
 
-After training an autoregressive model on the tiny-stories dataset, I always wondered, "where to go next".
-So I decided on a maths reasoning model trained on a part of the `math-ai/AutoMathText` dataset.
-I specifically used these subsets:
+1. `0.70-to-1.00`
+2. `0.60-to-1.00`
 
-1. 0.70-to-1.00
-2. 0.60-to-1.00
+These subsets were about 10GB in total.
 
-I alaways struggled to find a good dataset when training a model.
-So here I choosed these two subsets, which alone cost me 10GB in size.
-
-# My Key Learnings
+# Key Learnings
 
 ## Data Processing
 
-While I always played with samll datasets with less size, I never realized how extensive tokenization on a huge corpus gets, and how the complexity grows linearly.
+With larger corpora, tokenization and packing became a bigger bottleneck than model training itself.
 
-While training my model a couple of times, I came to know that the data processing took more time than actually training the model.
-
-After some searching, I later found a process that worked well for me to handle this huge daata:
+The pipeline that worked well:
 
 ```text
 HF dataset
-    ↓
-Tokenize
-    ↓
-Pack
-    ↓
-Save .bin + .idx
-    ↓
-Memory-map
-    ↓
-Torch Dataset
-    ↓
-DataLoader
-    ↓
-Model
+    -> Tokenize
+    -> Pack
+    -> Save .bin + .idx
+    -> Memory-map
+    -> Torch Dataset
+    -> DataLoader
+    -> Model
 ```
 
-This reduced huge amounts of time for me honestly speaking.
-It took me sometime to set up, but it was completley worth it.
+This reduced overall iteration time significantly.
 
 ## Dataset Sampling
 
-I implemented fixed dataset sampling.
-
-There's no need to stick to just one dataset when pre-training.
-You can take a mixture of datasets and tokenize them together, which helps the model perform well in generallly.
+I used fixed dataset sampling. Mixing multiple datasets during pre-training gave better generalization than staying on a single source.
 
 ## Checkpointing
 
-I learned that saving the optimizer & scaler is necessary when you want to resume training from a checkpoint save, but you don't need them for the final checkpoint save.
-
-But you can still store them if u don't care about size, and later split the `state_dict` alone and save it separately.
+I learned that optimizer/scaler states are required for resume checkpoints, but not strictly required for final inference checkpoints.
 
 ## Scaling Laws
 
-I learned that you have to train on roughly `20 * params` tokens to get the best out of it, according to the chinchila paper'qs scaling laws.
+I followed the Chinchilla-style heuristic: train on roughly `20 x params` tokens.
 
-## optimization stuff
+## Optimization Changes
 
-- added QK normalization which improves overfitting gradient stability
-- FFN aligntment change which help utlize the GPU kernel better & faster matmul FLOPS
+- Added QK normalization to improve gradient stability and reduce overfitting behavior.
+- Adjusted FFN alignment for better GPU kernel utilization and matmul throughput.
 
-changing these both improved the training stability,
-smooth convergence, and better stable learnings.
+These improved stability and convergence smoothness.
 
-## deployment stuff
+## Deployment Setup
 
-over the running and utilizing the machine specs:
+### Machine configuration
 
 - `--machine_type g2-standard-24`
 - `--accelerator_type NVIDIA_L4`
@@ -82,15 +61,20 @@ over the running and utilizing the machine specs:
 - `--replica_count 1`
 - `--boot_disk_size 300`
 
-which is equal to:
+Approximate resources:
 
-`2 *24 + 2* 16 + 300 = 94 GB of RAM + 300GB disk`
-`2 * 24 = 48 GB of VRAM`
+- RAM: `2*24 + 2*16 = 80 GB` (vCPU+GPU memory mapping estimate used during planning)
+- VRAM: `2*24 = 48 GB`
+- Disk: `300 GB`
 
-well, there's 2 reason for using this big setup.
+### Why this setup
 
-for disk used for packing huge corpus of data from:
+- Large disk was needed for packing large raw corpora safely.
+- I iterated over multiple failed deployments to find stable packing + training settings.
 
+Datasets used in packing:
+
+```json
 [
   {
     "name": "open-web-math/open-web-math",
@@ -119,10 +103,18 @@ for disk used for packing huge corpus of data from:
     "text_column": "context"
   }
 ]
+```
 
-these above files alone comes around 50GB + 50GB = 100GB already,
-so for safer side I've given the 300GB.
+# Images Analysis 
 
-utilizing the specs to the maximum, I ran through mutliple deployment failure to understand just right config for packing & training.
+### Deployment timeline
 
-[image](images/deployments.png)
+![Deployment timeline](images/deployments.png)
+
+### GPU utilization
+
+![GPU utilization](images/gpu-utilization.png)
+
+### System utilization
+
+![System utilization](images/utilization.png)
