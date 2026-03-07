@@ -1,0 +1,3 @@
+2026-03-01T15:18:05.188412 | [Trainer] Model: 51.35M trainable / 51.35M total (100.0%)
+2026-03-01T15:18:05.188493 | [Trainer] Optimizer: ADAMW | LR: 5.00e-04 | Weight Decay: 0.1
+2026-03-01T15:18:05.189022 | [Trainer] GPU Memory: 0.20GB allocated | Device: cuda

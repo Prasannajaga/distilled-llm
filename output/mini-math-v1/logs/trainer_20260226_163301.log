@@ -1,0 +1,7 @@
+2026-02-26T22:03:01.694384 | [Trainer] Model: 51.35M trainable / 51.35M total (100.0%)
+2026-02-26T22:03:01.694464 | [Trainer] Optimizer: ADAMW | LR: 5.00e-04 | Weight Decay: 0.1
+2026-02-26T22:03:01.695003 | [Trainer] GPU Memory: 0.20GB allocated | Device: cuda
+2026-02-27T00:17:49.102390 | [Trainer] Saved checkpoint: ./output/mini-math-v1/ckpt_10000.pt
+2026-02-27T00:17:49.317047 | [Trainer] Stop requested ...
+2026-02-27T00:17:49.318997 | [Trainer] Training complete: 10000 steps in 8084.4s (134.7min)
+2026-02-27T00:17:49.319370 | [Trainer] Peak GPU memory: 3.68GB
