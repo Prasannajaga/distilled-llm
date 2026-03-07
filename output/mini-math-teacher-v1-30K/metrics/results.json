@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-03-06T22:46:36.487355Z",
+  "run": {
+    "global_step": 30000,
+    "target_total_steps": 30000,
+    "world_size": 2,
+    "tokens_trained_local": 2209680000,
+    "tokens_trained_global_estimate": 4419360000,
+    "train_time_seconds": 139166.926,
+    "tokens_per_second_global_estimate": 31755.821
+  },
+  "loss": {
+    "best_train_loss": 1.760599970817566,
+    "best_train_loss_step": 11720,
+    "worst_train_loss": 10.560412406921387,
+    "final_train_loss": 3.5597574710845947,
+    "best_val_loss": 3.2708795070648193,
+    "best_val_loss_step": 30000,
+    "final_val_loss": 3.2708795070648193
+  },
+  "model": {
+    "name": "GQATransformer",
+    "n_layer": 18,
+    "n_embd": 768,
+    "n_head": 16,
+    "block_size": 1024,
+    "total_params": 146790432,
+    "trainable_params": 146790432,
+    "trainable_percent": 100.0
+  },
+  "optimization": {
+    "optimizer": "adamw",
+    "lr": 0.00012,
+    "eps": 1e-08,
+    "weight_decay": 0.1,
+    "grad_clip_norm": 1.0,
+    "grad_accum_steps": 12,
+    "train_batch_size_per_process": 6,
+    "eval_batch_size_per_process": 2,
+    "effective_batch_size_global": 144,
+    "use_amp": true,
+    "amp_dtype": "bfloat16",
+    "gradient_checkpointing": true
+  },
+  "system": {
+    "device": "cuda:0",
+    "gpu_count_visible": 2,
+    "peak_memory_gb": 10.635,
+    "allocated_memory_gb": 2.28,
+    "reserved_memory_gb": 2.65
+  },
+  "dataset": {
+    "bin_path": "/tmp/vertex-bins/data.bin",
+    "dataset_build_summary_path": "/tmp/vertex-bins/dataset_build_summary.json",
+    "source_datasets": [
+      {
+        "name": "open-web-math/open-web-math",
+        "split": "train",
+        "text_column": "text"
+      },
+      {
+        "name": "HuggingFaceFW/fineweb",
+        "subset": "sample-10BT",
+        "split": "train",
+        "text_column": "text",
+        "data_files": [
+          "sample/10BT/000_00000.parquet",
+          "sample/10BT/001_00000.parquet",
+          "sample/10BT/002_00000.parquet",
+          "sample/10BT/003_00000.parquet",
+          "sample/10BT/004_00000.parquet",
+          "sample/10BT/005_00000.parquet",
+          "sample/10BT/006_00000.parquet",
+          "sample/10BT/007_00000.parquet"
+        ]
+      },
+      {
+        "name": "incredible45/Gutenberg-BookCorpus-Cleaned-Data-English",
+        "split": "train",
+        "text_column": "context"
+      }
+    ],
+    "source_dataset_count": 3,
+    "source_dataset_rows": [
+      {
+        "name": "open-web-math/open-web-math",
+        "subset": null,
+        "split": "train",
+        "text_column": "text",
+        "rows": 6315233
+      },
+      {
+        "name": "HuggingFaceFW/fineweb",
+        "subset": "sample-10BT",
+        "split": "train",
+        "text_column": "text",
+        "rows": 8363014
+      },
+      {
+        "name": "incredible45/Gutenberg-BookCorpus-Cleaned-Data-English",
+        "subset": null,
+        "split": "train",
+        "text_column": "context",
+        "rows": 58653
+      }
+    ],
+    "total_dataset_samples": 14736900,
+    "train_split_samples": 21340157,
+    "val_split_samples": 5335039,
+    "total_sequences": 26675196,
+    "packed_total_sequences": 26675196,
+    "packed_total_tokens": 27315400704
+  },
+  "vertex": {
+    "enabled": true,
+    "aip_model_dir": "gs://transformer-garage/training_logs/mini-math-teacher-v1-30K/model/",
+    "aip_checkpoint_dir": "gs://transformer-garage/training_logs/mini-math-teacher-v1-30K/checkpoints/",
+    "rank": 0,
+    "local_rank": 0,
+    "world_size": 2,
+    "is_distributed": true,
+    "experiment_events_path": "/outputs/mini-code-v1/logs/vertex_events_20260305_080256.jsonl"
+  },
+  "artifacts": {
+    "ckpt_dir": "/outputs/mini-code-v1",
+    "final_checkpoint_path": "/outputs/mini-code-v1/final_ckpt_30000.pt",
+    "step_metrics_path": "/outputs/mini-code-v1/logs/trainer_steps_20260305_080256.jsonl",
+    "tensorboard_dir": "/outputs/mini-code-v1/logs/tensorboard",
+    "prompt_metrics_path": "/outputs/mini-code-v1/metrics/prompt_metrics_step_30000.json"
+  }
+}

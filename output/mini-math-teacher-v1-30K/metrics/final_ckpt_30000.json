@@ -1,0 +1,39 @@
+{
+  "model": {
+    "name": "GQATransformer",
+    "checkpoint_path": "/outputs/mini-code-v1/final_ckpt_30000.pt",
+    "timestamp": "2026-03-06T22:42:44.322909",
+    "total_params": 146790432,
+    "trainable_params": 146790432
+  },
+  "training": {
+    "total_steps": 30000,
+    "tokens_trained": 2209680000,
+    "time_seconds": 139166.93,
+    "tokens_per_second": 15877.91
+  },
+  "train_loss": {
+    "best": 1.760599970817566,
+    "worst": 10.560412406921387,
+    "final": 3.5597574710845947,
+    "best_step": 11720
+  },
+  "val_loss": {
+    "best": 3.2708795070648193,
+    "final": 3.2708795070648193,
+    "best_step": 30000
+  },
+  "system": {
+    "device": "cuda:0",
+    "gpu_count": 2,
+    "peak_memory_gb": 10.635
+  },
+  "optimizer": {
+    "name": "adamw",
+    "lr": 0.00012,
+    "weight_decay": 0.1,
+    "grad_accum_steps": 12,
+    "batch_size": 6,
+    "effective_batch_size": 72
+  }
+}
