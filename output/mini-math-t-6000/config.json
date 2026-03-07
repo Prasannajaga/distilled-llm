@@ -1,0 +1,71 @@
+{
+  "created_at_utc": "2026-03-04T09:13:18.100319+00:00",
+  "library": {
+    "project": "distilled-llm",
+    "python_version": "3.10.18",
+    "torch_version": "2.4.0+cu124"
+  },
+  "model_config": {
+    "architectures": [
+      "GQATransformer"
+    ],
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "hidden_size": 768,
+    "max_position_embeddings": 1024,
+    "model_type": "gqa_transformer",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 18,
+    "num_key_value_heads": 8,
+    "pad_token_id": 2,
+    "tie_word_embeddings": false,
+    "torch_dtype": "bfloat16",
+    "transformers_version": "5.2.0",
+    "use_cache": true,
+    "vocab_size": 32000
+  },
+  "schema_version": "1.0",
+  "training_config": {
+    "amp_dtype": "bfloat16",
+    "betas": [
+      0.9,
+      0.95
+    ],
+    "block_size": 1024,
+    "ckpt_dir": "/outputs/mini-code-v1",
+    "ckpt_interval_steps": 3000,
+    "clear_cache_interval": 100,
+    "device": "cuda",
+    "enable_gradient_checkpointing": true,
+    "enable_logging": true,
+    "eps": 1e-08,
+    "eval_batch_size": 2,
+    "grad_accum_steps": 12,
+    "grad_clip_norm": 1.0,
+    "log_interval_steps": 100,
+    "log_memory_usage": true,
+    "log_per_iteration_time": false,
+    "lr": 0.00015,
+    "max_new_tokens": 512,
+    "mixed_precision": true,
+    "n_embd": 768,
+    "n_head": 16,
+    "n_layer": 18,
+    "num_workers": 12,
+    "optimizer": "adamw",
+    "repetition_penalty": 1.2,
+    "save_optimizer_state": true,
+    "seed": 42,
+    "stop_on_eos": true,
+    "temperature": 0.7,
+    "top_k": 50,
+    "total_steps": 6000,
+    "train_batch_size": 6,
+    "use_amp": true,
+    "use_repetition_penalty": true,
+    "use_top_k": true,
+    "validation_batch_count": 20,
+    "warmup_steps": 600,
+    "weight_decay": 0.1
+  }
+}

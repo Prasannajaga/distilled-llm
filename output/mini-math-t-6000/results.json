@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-03-04T13:06:20.094215Z",
+  "run": {
+    "global_step": 6000,
+    "target_total_steps": 6000,
+    "world_size": 2,
+    "tokens_trained_local": 441936000,
+    "tokens_trained_global_estimate": 883872000,
+    "train_time_seconds": 27894.691,
+    "tokens_per_second_global_estimate": 31686.03
+  },
+  "loss": {
+    "best_train_loss": 2.377139091491699,
+    "best_train_loss_step": 4099,
+    "worst_train_loss": 10.574820518493652,
+    "final_train_loss": 4.026777267456055,
+    "best_val_loss": 3.933087110519409,
+    "best_val_loss_step": 6000,
+    "final_val_loss": 3.933087110519409
+  },
+  "model": {
+    "name": "GQATransformer",
+    "n_layer": 18,
+    "n_embd": 768,
+    "n_head": 16,
+    "block_size": 1024,
+    "total_params": 146790432,
+    "trainable_params": 146790432,
+    "trainable_percent": 100.0
+  },
+  "optimization": {
+    "optimizer": "adamw",
+    "lr": 0.00015,
+    "eps": 1e-08,
+    "weight_decay": 0.1,
+    "grad_clip_norm": 1.0,
+    "grad_accum_steps": 12,
+    "train_batch_size_per_process": 6,
+    "eval_batch_size_per_process": 2,
+    "effective_batch_size_global": 144,
+    "use_amp": true,
+    "amp_dtype": "bfloat16",
+    "gradient_checkpointing": true
+  },
+  "system": {
+    "device": "cuda:0",
+    "gpu_count_visible": 2,
+    "peak_memory_gb": 10.635,
+    "allocated_memory_gb": 2.28,
+    "reserved_memory_gb": 2.514
+  },
+  "dataset": {
+    "bin_path": "/tmp/vertex-bins/data.bin",
+    "dataset_build_summary_path": "/tmp/vertex-bins/dataset_build_summary.json",
+    "source_datasets": [
+      {
+        "name": "DKYoon/SlimPajama-6B",
+        "split": "train",
+        "text_column": "text"
+      },
+      {
+        "name": "open-web-math/open-web-math",
+        "split": "train",
+        "text_column": "text"
+      }
+    ],
+    "source_dataset_count": 2,
+    "source_dataset_rows": [
+      {
+        "name": "DKYoon/SlimPajama-6B",
+        "subset": null,
+        "split": "train",
+        "text_column": "text",
+        "rows": 5489000
+      },
+      {
+        "name": "open-web-math/open-web-math",
+        "subset": null,
+        "split": "train",
+        "text_column": "text",
+        "rows": 6315233
+      }
+    ],
+    "total_dataset_samples": 11804233,
+    "train_split_samples": 17553918,
+    "val_split_samples": 3097750,
+    "total_sequences": 20651668,
+    "packed_total_sequences": 20651668,
+    "packed_total_tokens": 21147308032
+  },
+  "vertex": {
+    "aip_model_dir": "gs://transformer-garage/training_logs/mini-math-balanced-v1/model/",
+    "aip_checkpoint_dir": "gs://transformer-garage/training_logs/mini-math-balanced-v1/checkpoints/",
+    "rank": 0,
+    "local_rank": 0,
+    "world_size": 2,
+    "is_distributed": true
+  },
+  "artifacts": {
+    "ckpt_dir": "/outputs/mini-code-v1",
+    "final_checkpoint_path": "/outputs/mini-code-v1/final_ckpt_6000.pt",
+    "step_metrics_path": "/outputs/mini-code-v1/logs/trainer_steps_20260304_052113.jsonl"
+  }
+}
