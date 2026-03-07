@@ -8,7 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
-output/
+output/*.pt
 dist/
 data/
 test.py
@@ -18,3 +18,8 @@ test.py
 test.py
 transformers-model-486215-a2-8774b5cab7f9.json
 scripts/verify_vertex_experiments.py
+*.pt
+output/mini-math-S3/
+output/mini-math-S4/
+output/mini-math-student/ 
+output/mini-math-t3/
