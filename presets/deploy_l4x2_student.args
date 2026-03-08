@@ -1,66 +1,63 @@
-# Job metadata
---display_name distilled-llm-l4x2-baseline
---base_output_dir gs://YOUR_BUCKET/training_logs/baseline
---staging_bucket gs://YOUR_BUCKET
+# Local preset for scripts.train_vertex (not deploy.py / not Vertex cloud)
+#
+# Usage (single GPU):
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# uv run python -m scripts.train_vertex $(awk '!/^($|#)/{printf "%s ",$0}' presets/deploy_l4x2_student.args)
+#
+# Usage (2 GPUs local DDP):
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# uv run python -m torch.distributed.run --nproc_per_node=2 --module scripts.train_vertex \
+#   $(awk '!/^($|#)/{printf "%s ",$0}' presets/deploy_l4x2_student.args)
+#
+# NOTE:
+# - Set --bin_path to your local packed data.bin path before running.
+# - block_size must match the block size used to build the bin.
 
-# Machine config
---machine_type g2-standard-24
---accelerator_type NVIDIA_L4
---accelerator_count 2
---replica_count 1
---boot_disk_size 200
---train_image us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest
+--bin_path /media/prasanna/716F26140AED9B67/datasets/data.bin
+--device cuda
+--seed 42
+--num_workers 8
 
-# Launcher
---train_module scripts.run_step_train
---nproc_per_node 2
---local_ckpt_dir /outputs/mini-code-v1
---train_log_level INFO
---train_progress_bar 0
---train_vertex_project YOUR_PROJECT_ID
---train_vertex_location us-central1
---train_vertex_experiment_name distilled-llm-baseline
---train_vertex_run_name distilled-llm-l4x2-baseline
-
-# Dataset packing
---data_bin_dir /tmp/vertex-bins
---data_bin_name data.bin
---block_size 512
---datasets_json /home/prasanna/coding/distilled-llm/data/dataset_mixture.json
---data_num_workers 8
---data_pack_batch_size 1024
---tokenizer_model TinyLlama/TinyLlama-1.1B-Chat-v1.0
-
-# Training/model
---train_device cuda
---train_seed 42
---train_num_workers 6
+# Student model
 --n_layer 12
 --n_embd 768
 --n_head 12
---train_batch_size 8
---eval_batch_size 4
---grad_accum_steps 8
+--block_size 1024
+
+# Batching
+--train_batch_size 1
+--eval_batch_size 1
+--grad_accum_steps 64
 --validation_batch_count 20
 --val_ratio 0.2
+
+# Optimizer / schedule (10k smooth + faster convergence tuning)
 --optimizer adamw
---lr 2e-4
+--lr 2.2e-4
 --eps 1e-8
 --weight_decay 0.1
 --grad_clip_norm 1.0
 --use_amp 1
---amp_dtype bfloat16
+--amp_dtype float16
 --enable_gradient_checkpointing 1
---enable_metrics 0
---enable_vertex 1
---enable_tensorboard 1
---tensorboard_hist_interval_steps 500
---total_steps 1000
---warmup_steps 100
---ckpt_interval_steps 1000
+--total_steps 10000
+--warmup_steps 1000
+
+# Logging / artifacts (local)
+--ckpt_dir ./output/mini-math-student-local-10k
+--ckpt_interval_steps 2500
 --save_optimizer_state 1
 --log_interval_steps 100
+--enable_tensorboard 0
+--tensorboard_hist_interval_steps 500
+--enable_vertex 0
+--enable_metrics 0 
 
-# Optional:
-# --metrics_prompts_json /home/prasanna/coding/distilled-llm/data/metrics_prompts.json
-# --async_run
+# Resume options: 
+--resume_from ./output/mini-math-student-local-10k/model_5000.pt
+
+
+# If you still hit OOM:
+# - keep block_size fixed to match bin
+# - run single GPU first
+# - lower grad_accum only after OOM is gone

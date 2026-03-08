@@ -8,6 +8,7 @@ import os
 import gc
 import time
 import math
+import re
 import sys
 import json
 import tempfile
@@ -72,8 +73,18 @@ class Trainer:
                 self.metrics_dir = os.path.join(self.ckpt_dir, "metrics")
                 os.makedirs(self.metrics_dir, exist_ok=True)
 
-        # device placement
-        self.model.to(self.device)
+        # device placement (defensive fallback for broken CUDA runtime)
+        try:
+            self.model.to(self.device)
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            if self.device.type == "cuda" and "cuda" in msg:
+                self.device = torch.device("cpu")
+                self.config.device = "cpu"
+                print(f"[DEVICE] CUDA move failed ({exc}). Falling back to CPU.")
+                self.model.to(self.device)
+            else:
+                raise
         self._setup_gradient_checkpointing()
 
         # AMP setup: disable on CPU automatically
@@ -742,10 +753,17 @@ class Trainer:
         path = os.path.join(self.ckpt_dir, fname)
         model_to_save = self._unwrap_model()
         payload = {"model_state_dict": model_to_save.state_dict()}
+        
         if include_training_step:
             payload["training_step"] = step
+            # Keep both keys for compatibility with state_dict()/load_state_dict() paths.
+            payload["global_step"] = step
+        # Persist config in checkpoint payload so resume does not depend on sidecar files.
+        payload["config"] = asdict(self.config)
+        
         if include_optimizer_state is None:
             include_optimizer_state = bool(self.config.save_optimizer_state)
+        
         if include_scaler_state is None:
             include_scaler_state = bool(include_optimizer_state)
 
@@ -761,12 +779,14 @@ class Trainer:
 
         if include_optimizer_state:
             payload["optimizer_state_dict"] = self.optimizer.state_dict()
+        
         if include_scaler_state and self.scaler is not None:
             try:
                 payload["scaler_state_dict"] = self.scaler.state_dict()
             except Exception:
                 payload["scaler_state_dict"] = None
         torch.save(payload, path)
+
         self._log(f"[Trainer] Saved checkpoint: {path}")
         self._track_vertex_event(
             "checkpoint_saved",
@@ -790,10 +810,15 @@ class Trainer:
         return ckpt_path
 
     def load_checkpoint(self, path: str, map_location: Optional[torch.device] = None) -> Dict[str, Any]:
+        
         if map_location is None:
             map_location = self.device
+            
         data = torch.load(path, map_location=map_location)
+        if "model_state_dict" not in data:
+            raise KeyError(f"Checkpoint missing required key 'model_state_dict': {path}")
         self._unwrap_model().load_state_dict(data["model_state_dict"], strict=True)
+
         if "optimizer_state_dict" in data and data["optimizer_state_dict"] is not None:
             try:
                 self.optimizer.load_state_dict(data["optimizer_state_dict"])
@@ -804,14 +829,38 @@ class Trainer:
                 self.scaler.load_state_dict(data["scaler_state_dict"])
             except Exception:
                 pass
-        self.global_step = int(data.get("training_step", 0))
+       
+        # first callback to check if the steps available in the model file 
+        step_value = data.get("training_step", None)
+        if step_value is None:
+            step_value = data.get("global_step", None)
+        if step_value is None:
+            # Older final checkpoints may omit step fields; infer from filename suffix.
+            name = os.path.basename(path)
+            match = re.search(r"_(\d+)\.pt$", name)
+            if match:
+                step_value = int(match.group(1))
+        self.global_step = int(step_value or 0)
         saved_cfg = data.get("config", None)
+
+        # fallback check if checkpoints not available there load config.json.
+        if saved_cfg is None:
+            try:
+                cfg_path = os.path.join(os.path.dirname(os.path.abspath(path)), "config.json")
+                if os.path.isfile(cfg_path):
+                    with open(cfg_path, "r", encoding="utf-8") as fp:
+                        saved_cfg = json.load(fp)
+            except Exception:
+                saved_cfg = None
+
         if saved_cfg and self.total_steps is None:
             self.total_steps = int(saved_cfg.get("total_steps")) if saved_cfg.get("total_steps") else None
             self.warmup_steps = int(saved_cfg.get("warmup_steps", self.warmup_steps))
+
         self._update_lr()
         self._unwrap_model().to(self.device)
         self._log(f"[Trainer] Loaded checkpoint from {path} (step {self.global_step})")
+
         return data
   
     # Validation loss estimation   

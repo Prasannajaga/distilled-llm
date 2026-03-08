@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import os
+import re
 import sys
 import logging
 import faulthandler
@@ -239,6 +240,12 @@ def parse_args() -> argparse.Namespace:
         default=_env_int("TRAIN_CKPT_INTERVAL_STEPS", BASE_CONFIG.ckpt_interval_steps),
     )
     parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=os.environ.get("TRAIN_RESUME_FROM", None),
+        help="Checkpoint path to resume from, or 'latest' to pick the highest-step checkpoint from ckpt_dir.",
+    )
+    parser.add_argument(
         "--save_optimizer_state",
         type=int,
         choices=[0, 1],
@@ -250,6 +257,68 @@ def parse_args() -> argparse.Namespace:
         default=_env_int("TRAIN_LOG_INTERVAL_STEPS", BASE_CONFIG.log_interval_steps),
     )
     return parser.parse_args()
+
+
+def _ckpt_step_from_name(path: str) -> int:
+    """Extract trailing numeric step from checkpoint file names like model_2500.pt."""
+    name = os.path.basename(path)
+    match = re.search(r"_(\d+)\.pt$", name)
+    if not match:
+        return -1
+    try:
+        return int(match.group(1))
+    except Exception:
+        return -1
+
+
+def resolve_resume_checkpoint(resume_from: str | None, ckpt_dir: str | None) -> str | None:
+    if resume_from is None:
+        return None
+    raw = str(resume_from).strip()
+    if not raw:
+        return None
+
+    if raw.lower() != "latest":
+        resolved = os.path.abspath(raw)
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(f"resume_from checkpoint not found: {resolved}")
+        return resolved
+
+    if not ckpt_dir:
+        raise ValueError("resume_from=latest requires --ckpt_dir.")
+    ckpt_root = os.path.abspath(ckpt_dir)
+    
+    if not os.path.isdir(ckpt_root):
+        raise FileNotFoundError(f"ckpt_dir does not exist for resume_from=latest: {ckpt_root}")
+
+    model_ckpts: list[tuple[int, str]] = []
+    final_ckpts: list[tuple[int, str]] = []
+    for fname in os.listdir(ckpt_root):
+        
+        if not fname.endswith(".pt"):
+            continue
+
+        full_path = os.path.join(ckpt_root, fname)
+        if not os.path.isfile(full_path):
+            continue
+        
+        step = _ckpt_step_from_name(fname)
+        if step < 0:
+            continue
+
+        if fname.startswith("model_"):
+            model_ckpts.append((step, full_path))
+        elif fname.startswith("final_ckpt_"):
+            final_ckpts.append((step, full_path))
+
+    if model_ckpts:
+        model_ckpts.sort(key=lambda item: item[0], reverse=True)
+        return model_ckpts[0][1]
+    if final_ckpts:
+        final_ckpts.sort(key=lambda item: item[0], reverse=True)
+        return final_ckpts[0][1]
+    
+    return None
 
 
 def build_training_config(args: argparse.Namespace) -> TrainingConfig:
@@ -764,6 +833,23 @@ def main():
                 tokenizer=tokenizer,
                 ckpt_dir=config.ckpt_dir,
                 prompts=metrics_prompts if is_main else None,
+            )
+
+        resume_ckpt_path = resolve_resume_checkpoint(args.resume_from, config.ckpt_dir)
+        if resume_ckpt_path:
+            with log_stage("checkpoint_resume", path=resume_ckpt_path):
+                trainer.load_checkpoint(resume_ckpt_path, map_location=device)
+                if is_main and os.path.basename(resume_ckpt_path).startswith("final_ckpt_") and trainer.global_step <= 0:
+                    LOGGER.warning(
+                        "resumed_from_final_checkpoint_without_step path=%s; "
+                        "global_step remained 0 because final checkpoints omit training_step.",
+                        resume_ckpt_path,
+                    )
+        elif args.resume_from:
+            LOGGER.warning(
+                "resume_from requested (%s) but no checkpoint was found in ckpt_dir=%s; starting fresh.",
+                args.resume_from,
+                config.ckpt_dir,
             )
 
         if is_main and config.enable_vertex_tracking and AIP_CHECKPOINT_DIR:

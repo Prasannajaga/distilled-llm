@@ -1,0 +1,4 @@
+2026-03-07T22:03:53.355680 | [Trainer] Warning: Gradient checkpointing not supported by model
+2026-03-07T22:03:53.528285 | [Trainer] Model: 106.05M trainable / 106.05M total (100.0%)
+2026-03-07T22:03:53.528362 | [Trainer] Optimizer: ADAMW | LR: 2.20e-04 | Weight Decay: 0.1
+2026-03-07T22:03:53.528804 | [Trainer] GPU Memory: 0.45GB allocated | Device: cuda

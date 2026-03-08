@@ -1,0 +1,4 @@
+2026-03-08T10:20:22.875282 | [Trainer] Warning: Gradient checkpointing not supported by model
+2026-03-08T10:20:22.876221 | [Trainer] Model: 106.05M trainable / 106.05M total (100.0%)
+2026-03-08T10:20:22.876250 | [Trainer] Optimizer: ADAMW | LR: 2.20e-04 | Weight Decay: 0.1
+2026-03-08T10:20:25.095109 | [Trainer] Loaded checkpoint from /home/prasanna/coding/distilled-llm/output/mini-math-student-local-10k/model_5000.pt (step 5000)

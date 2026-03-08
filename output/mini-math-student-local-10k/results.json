@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-03-08T13:27:34.163950Z",
+  "run": {
+    "global_step": 10000,
+    "target_total_steps": 10000,
+    "world_size": 1,
+    "tokens_trained_local": 327360000,
+    "tokens_trained_global_estimate": 327360000,
+    "train_time_seconds": 30665.541,
+    "tokens_per_second_global_estimate": 10675.175
+  },
+  "loss": {
+    "best_train_loss": 0.002330780029296875,
+    "best_train_loss_step": 6118,
+    "worst_train_loss": 8.159815788269043,
+    "final_train_loss": 4.36845064163208,
+    "best_val_loss": 3.8065288066864014,
+    "best_val_loss_step": 9700,
+    "final_val_loss": 3.8065521717071533
+  },
+  "model": {
+    "name": "GQATransformer",
+    "n_layer": 12,
+    "n_embd": 768,
+    "n_head": 12,
+    "block_size": 1024,
+    "total_params": 106052496,
+    "trainable_params": 106052496,
+    "trainable_percent": 100.0
+  },
+  "optimization": {
+    "optimizer": "adamw",
+    "lr": 0.00022,
+    "eps": 1e-08,
+    "weight_decay": 0.1,
+    "grad_clip_norm": 1.0,
+    "grad_accum_steps": 64,
+    "train_batch_size_per_process": 1,
+    "eval_batch_size_per_process": 1,
+    "effective_batch_size_global": 64,
+    "use_amp": true,
+    "amp_dtype": "float16",
+    "gradient_checkpointing": true
+  },
+  "system": {
+    "device": "cuda",
+    "gpu_count_visible": 1,
+    "peak_memory_gb": 2.791,
+    "allocated_memory_gb": 1.255,
+    "reserved_memory_gb": 1.303
+  },
+  "dataset": {
+    "bin_path": "/media/prasanna/716F26140AED9B67/datasets/data.bin",
+    "dataset_build_summary_path": null,
+    "source_datasets": null,
+    "source_dataset_count": null,
+    "source_dataset_rows": null,
+    "total_dataset_samples": null,
+    "train_split_samples": 21340157,
+    "val_split_samples": 5335039,
+    "total_sequences": 26675196,
+    "packed_total_sequences": null,
+    "packed_total_tokens": null
+  },
+  "vertex": {
+    "enabled": false,
+    "aip_model_dir": null,
+    "aip_checkpoint_dir": null,
+    "rank": 0,
+    "local_rank": 0,
+    "world_size": 1,
+    "is_distributed": false,
+    "experiment_events_path": null
+  },
+  "artifacts": {
+    "ckpt_dir": "./output/mini-math-student-local-10k",
+    "final_checkpoint_path": "./output/mini-math-student-local-10k/final_ckpt_10000.pt",
+    "step_metrics_path": null,
+    "tensorboard_dir": null,
+    "prompt_metrics_path": null
+  }
+}
