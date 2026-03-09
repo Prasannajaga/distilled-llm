@@ -1,0 +1,32 @@
+
+Trained mini-math-teacher-v1-30K (146.8M params, GQATransformer)
+
+well fellas It was fine experiements I ran last few days 
+I have learned quite a deep about pre-training works now 
+I'll documented each thing in my repo here please find out 
+
+this is purely inspired by nanoGPT setup and thanks to 
+karpathy sensei for pushing us all forward
+
+
+Dataset mixture:
+
+56.75% FineWeb  
+42.85% OpenWebMath 
++0.4% Gutenberg
+
+Packed corpus: 27.3B tokens, run consumed 4.42B (~16.2% coverage).
+Throughput held ~31.8k tok/s (train), inference ~32.9 tok/s.
+
+Honest eval at 30k steps:
+The model mimics math/forum/textbook style but does not reliably solve prompts yet.
+there's still room to improve but unfortunately I lost all my credits on this 2 days run
+
+for this run I have used (Vertex AI, g2-standard-24, 2x NVIDIA L4):
+mini-math-teacher-v1-30K stopped at 30k because I ran out of Free credits in GCP 
+
+
+well I dropped the baseline you can fine-tune and play with it on your
+consumer GPU's 
+
+I'll drop detailed usage sooner
