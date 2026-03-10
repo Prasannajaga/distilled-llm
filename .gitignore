@@ -26,3 +26,4 @@ output/mini-math-t3/
 output/mini-math-teacher-v1-30K/checkpoints_model_30000.safetensors
 output/mini-math-teacher-v1-30K/model.safetensors
 projects.txt
+scripts/eval_compare_models.py

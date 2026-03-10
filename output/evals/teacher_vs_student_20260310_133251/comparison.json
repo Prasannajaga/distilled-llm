@@ -1,0 +1,150 @@
+{
+  "created_at_utc": "2026-03-10T13:32:51.953112+00:00",
+  "dataset_source": "/home/prasanna/coding/distilled-llm/data/math_eval_100.jsonl",
+  "num_samples": 100,
+  "generation": {
+    "max_new_tokens": 32,
+    "temperature": 0.0,
+    "top_k": null,
+    "repetition_penalty": 1.0,
+    "prompt_template": "Question: {question}\nAnswer:",
+    "numeric_tolerance": 0.001
+  },
+  "teacher_summary": {
+    "model_label": "teacher",
+    "output_dir": "/home/prasanna/coding/distilled-llm/output/mini-math-teacher-v1-30K",
+    "checkpoint_path": "/home/prasanna/coding/distilled-llm/output/mini-math-teacher-v1-30K/checkpoints_model_30000.pt",
+    "num_samples": 100,
+    "exact_match_accuracy": 0.0,
+    "normalized_exact_match_accuracy": 0.0,
+    "answer_extraction_rate": 1.0,
+    "numeric_total": 100,
+    "numeric_exact_match_accuracy": 0.01,
+    "numeric_within_tolerance_accuracy": 0.01,
+    "avg_abs_numeric_error": 3.932719101123595e+28,
+    "avg_token_f1": 0.0,
+    "avg_char_similarity": 0.04947500212506259,
+    "avg_generated_tokens": 32.0,
+    "truncation_rate": 1.0,
+    "avg_latency_ms": 372.2023782903125,
+    "tokens_per_second": 85.97473274348737,
+    "reference_answer_nll_per_token": 2.2821206011730206,
+    "reference_answer_perplexity": 9.797434847638863
+  },
+  "student_summary": {
+    "model_label": "student",
+    "output_dir": "/home/prasanna/coding/distilled-llm/output/mini-math-student-local-10k",
+    "checkpoint_path": "/home/prasanna/coding/distilled-llm/output/mini-math-student-local-10k/final_ckpt_10000.pt",
+    "num_samples": 100,
+    "exact_match_accuracy": 0.0,
+    "normalized_exact_match_accuracy": 0.0,
+    "answer_extraction_rate": 1.0,
+    "numeric_total": 100,
+    "numeric_exact_match_accuracy": 0.0,
+    "numeric_within_tolerance_accuracy": 0.0,
+    "avg_abs_numeric_error": 1.1538461538461537e+29,
+    "avg_token_f1": 0.0,
+    "avg_char_similarity": 0.05676740463287779,
+    "avg_generated_tokens": 32.0,
+    "truncation_rate": 1.0,
+    "avg_latency_ms": 248.77622026957397,
+    "tokens_per_second": 128.62965747017458,
+    "reference_answer_nll_per_token": 2.444310163123167,
+    "reference_answer_perplexity": 11.522598143434328
+  },
+  "head_to_head": {
+    "total": 100,
+    "teacher_wins": 0,
+    "student_wins": 0,
+    "both_correct": 0,
+    "both_wrong": 100,
+    "teacher_win_rate": 0.0,
+    "student_win_rate": 0.0
+  },
+  "metric_explanations": [
+    {
+      "key": "exact_match_accuracy",
+      "direction": "higher",
+      "why": "Strict correctness score: model must output the exact expected answer.",
+      "improve_effect": "Higher value means fewer outright wrong final answers and better task reliability."
+    },
+    {
+      "key": "normalized_exact_match_accuracy",
+      "direction": "higher",
+      "why": "Correctness after normalization (spacing/punctuation/case). Reduces formatting noise.",
+      "improve_effect": "Higher value means semantic correctness is improving even when formatting differs."
+    },
+    {
+      "key": "numeric_exact_match_accuracy",
+      "direction": "higher",
+      "why": "For numeric tasks, checks exact numeric equality with ground truth.",
+      "improve_effect": "Higher value means stronger arithmetic precision and less numeric hallucination."
+    },
+    {
+      "key": "numeric_within_tolerance_accuracy",
+      "direction": "higher",
+      "why": "Counts near-correct numeric outputs as correct within tolerance.",
+      "improve_effect": "Higher value means model is converging toward correct magnitudes, even with rounding noise."
+    },
+    {
+      "key": "avg_abs_numeric_error",
+      "direction": "lower",
+      "why": "Average absolute distance from true numeric answers.",
+      "improve_effect": "Lower value means typical numeric mistakes are smaller and less harmful."
+    },
+    {
+      "key": "avg_token_f1",
+      "direction": "higher",
+      "why": "Overlap quality between prediction text and reference text.",
+      "improve_effect": "Higher value means better answer content coverage, even when exact strings differ."
+    },
+    {
+      "key": "avg_char_similarity",
+      "direction": "higher",
+      "why": "Character-level similarity to reference answer.",
+      "improve_effect": "Higher value means outputs are structurally closer to targets."
+    },
+    {
+      "key": "answer_extraction_rate",
+      "direction": "higher",
+      "why": "Measures how often model emits an extractable final answer.",
+      "improve_effect": "Higher value means better answer formatting and easier downstream evaluation."
+    },
+    {
+      "key": "reference_answer_nll_per_token",
+      "direction": "lower",
+      "why": "How probable the model thinks true answers are, token by token.",
+      "improve_effect": "Lower value means the model distribution aligns better with correct answers."
+    },
+    {
+      "key": "reference_answer_perplexity",
+      "direction": "lower",
+      "why": "Exponentiated NLL; interpretable confidence/calibration metric on correct answers.",
+      "improve_effect": "Lower value means model is less surprised by correct outputs, typically improving generation quality."
+    },
+    {
+      "key": "avg_generated_tokens",
+      "direction": "lower",
+      "why": "Average answer length generated.",
+      "improve_effect": "Lower (without losing accuracy) means more concise answers and lower inference cost."
+    },
+    {
+      "key": "truncation_rate",
+      "direction": "lower",
+      "why": "How often generation hit the max token cap.",
+      "improve_effect": "Lower value means fewer incomplete answers and better decoding control."
+    },
+    {
+      "key": "avg_latency_ms",
+      "direction": "lower",
+      "why": "Per-sample response time.",
+      "improve_effect": "Lower value means faster user experience and higher serving efficiency."
+    },
+    {
+      "key": "tokens_per_second",
+      "direction": "higher",
+      "why": "Generation throughput.",
+      "improve_effect": "Higher value means better deployment throughput and lower runtime cost per token."
+    }
+  ]
+}
