@@ -1,9 +1,11 @@
-# mini-math-teacher-v1-base-30K
+# mini-math-teacher-v1-30K
 
-`mini-math-teacher-v1-base-30K` is a 146.8M-parameter causal language model checkpoint trained for 30k steps with a GQA-based transformer architecture.
+`mini-math-teacher-v1-30K` is the 30,000-step teacher-model training run for this project: a 146.8M-parameter causal language model built with a GQA-based transformer and trained on a mixed web-and-math corpus.
 
-`base model:` model.safetensors
-`checkpoint model:` checkpoints_model_30000.safetensors (resume training from this optimizer & scaler)
+This README documents the exported weights in this folder, along with the training configuration, dataset mix, and final run metrics. Project code and training pipeline: [here](https://github.com/Prasannajaga/distilled-llm/tree/main/output/mini-math-teacher-v1-30K).
+
+`base model:` `model.safetensors`  
+`checkpoint model:` `checkpoints_model_30000.safetensors` (includes optimizer/scaler state for resuming training)
 
 ## Model Details
 
