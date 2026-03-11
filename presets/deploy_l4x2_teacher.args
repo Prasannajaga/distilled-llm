@@ -1,70 +1,95 @@
-# Job metadata
---display_name distilled-llm-l4x2-balanced-v5-30k
---base_output_dir gs://transformer-garage/training_logs/mini-math-teacher-v1-30K
---staging_bucket gs://transformer-garage
+# Local preset for scripts.train_vertex (converted from cloud teacher preset)
+#
+# Usage (single GPU):
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# uv run python -m scripts.train_vertex $(awk '!/^($|#)/{printf "%s ",$0}' presets/deploy_l4x2_teacher.args)
+#
+# Usage (2 GPUs local DDP):
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# uv run python -m torch.distributed.run --nproc_per_node=2 --module scripts.train_vertex \
+#   $(awk '!/^($|#)/{printf "%s ",$0}' presets/deploy_l4x2_teacher.args)
+#
+# NOTE:
+# - Set --bin_path to your local packed data.bin path before running.
+# - block_size must match the block size used to build the bin.
 
-# Machine config
---machine_type g2-standard-24
---accelerator_type NVIDIA_L4
---accelerator_count 2
---replica_count 1
---boot_disk_size 300
---train_image us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest
+# Cloud deploy.py args kept for reference (disabled for local train_vertex):
+# --display_name distilled-llm-l4x2-balanced-v5-30k
+# --base_output_dir gs://transformer-garage/training_logs/mini-math-teacher-v1-30K
+# --staging_bucket gs://transformer-garage
+# --machine_type g2-standard-24
+# --accelerator_type NVIDIA_L4
+# --accelerator_count 2
+# --replica_count 1
+# --boot_disk_size 300
+# --train_image us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-4.py310:latest
+# --train_module scripts.run_step_train
+# --nproc_per_node 2
+# --local_ckpt_dir /outputs/mini-code-v1
+# --train_log_level INFO
+# --train_progress_bar 1
+# --train_vertex_project transformer-garagegarage
+# --train_vertex_location us-central1
+# --train_vertex_experiment_name mini-math-balanced-v1
+# --train_vertex_run_name mini-math-teacher-v1-30K
+# --data_bin_dir /tmp/vertex-bins
+# --data_bin_name data.bin
+# --datasets_json /home/prasanna/coding/distilled-llm/data/dataset_mixture.json
+# --data_num_workers 18
+# --data_pack_batch_size 2042
+# --tokenizer_model TinyLlama/TinyLlama-1.1B-Chat-v1.0
+# --enable_bucket 1
+# --dataset_name mini-math-teacher-v1-30K
+# --train_device cuda
+# --train_seed 42
+# --train_num_workers 12
+# --train_batch_size 6
+# --eval_batch_size 2
 
-# Launcher
---train_module scripts.run_step_train
---nproc_per_node 2
---local_ckpt_dir /outputs/mini-code-v1
---train_log_level INFO
---train_progress_bar 1
---train_vertex_project transformer-garagegarage
---train_vertex_location us-central1
---train_vertex_experiment_name mini-math-balanced-v1
---train_vertex_run_name mini-math-teacher-v1-30K
+--bin_path /media/prasanna/716F26140AED9B67/datasets/data.bin
+--device cuda
+--seed 42
+--num_workers 12
 
-# Dataset packing
---data_bin_dir /tmp/vertex-bins
---data_bin_name data.bin
---datasets_json /home/prasanna/coding/distilled-llm/data/dataset_mixture.json
---data_num_workers 18
---data_pack_batch_size 2042
---tokenizer_model TinyLlama/TinyLlama-1.1B-Chat-v1.0
---enable_bucket 1
---dataset_name mini-math-teacher-v1-30K
-
-# Training/model 
---block_size 1024
---train_device cuda
---train_seed 42
---train_num_workers 12
+# Teacher model
 --n_layer 18
 --n_embd 768
 --n_head 16
---train_batch_size 6
---eval_batch_size 2
---grad_accum_steps 12
+--block_size 1024
+
+# Batching
+--train_batch_size 1
+--eval_batch_size 1
+--grad_accum_steps 64
 --validation_batch_count 20
 --val_ratio 0.20
+
+# Optimizer / schedule
 --optimizer adamw
---lr 1.2e-4
+--lr 1.2e-04
 --eps 1e-8
 --weight_decay 0.1
 --grad_clip_norm 1.0
 --use_amp 1
 --amp_dtype bfloat16
 --enable_gradient_checkpointing 1
---enable_metrics 1
---enable_vertex 1
---enable_tensorboard 1
---tensorboard_hist_interval_steps 500
---total_steps 30000
---warmup_steps 3000
---ckpt_interval_steps 10000
+--total_steps 40000
+--warmup_steps 300
+
+# Logging / artifacts (local)
+--ckpt_dir ./output/mini-math-teacher-v1-30K/resume/
+--ckpt_interval_steps 5000
 --save_optimizer_state 1
 --log_interval_steps 100
 
-# End-of-run prompt eval
---metrics_prompts_json /home/prasanna/coding/distilled-llm/data/metrics_prompts.json
+# Validate every log interval so step logs always include fresh val_loss.
+--eval_interval_steps 100
+--enable_tensorboard 1
+--tensorboard_hist_interval_steps 500
+--enable_vertex 0
+--enable_metrics 0
 
-# Optional:
-# --async_run
+# Resume options:
+--resume_from ./output/mini-math-teacher-v1-30K/checkpoints_model_30000.pt 
+--resume_schedule continue 
+--resume_additional_steps 0

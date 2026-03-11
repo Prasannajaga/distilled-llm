@@ -256,6 +256,33 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=_env_int("TRAIN_LOG_INTERVAL_STEPS", BASE_CONFIG.log_interval_steps),
     )
+    parser.add_argument(
+        "--eval_interval_steps",
+        type=int,
+        default=_env_int("TRAIN_EVAL_INTERVAL_STEPS", BASE_CONFIG.eval_interval_steps),
+        help="Run validation every N optimizer steps (independent from log_interval_steps).",
+    )
+    parser.add_argument(
+        "--resume_schedule",
+        type=str,
+        choices=["continue", "auto", "restart"],
+        default=_env_str("TRAIN_RESUME_SCHEDULE", "auto"),
+        help=(
+            "Resume LR schedule behavior: "
+            "'continue' keeps original cosine position, "
+            "'restart' rebases warmup/cosine at resume step, "
+            "'auto' rebases and treats total_steps<=resume_step as additional steps."
+        ),
+    )
+    parser.add_argument(
+        "--resume_additional_steps",
+        type=int,
+        default=_env_int("TRAIN_RESUME_ADDITIONAL_STEPS", 0),
+        help=(
+            "If >0 and resuming, run exactly this many additional optimizer steps "
+            "from the resumed global step."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -357,6 +384,7 @@ def build_training_config(args: argparse.Namespace) -> TrainingConfig:
     cfg.ckpt_interval_steps = int(args.ckpt_interval_steps)
     cfg.save_optimizer_state = bool(args.save_optimizer_state)
     cfg.log_interval_steps = int(args.log_interval_steps)
+    cfg.eval_interval_steps = int(args.eval_interval_steps)
     return cfg
 
 
@@ -758,6 +786,7 @@ def main():
                 train_batch_size=config.train_batch_size,
                 eval_batch_size=config.eval_batch_size,
                 lr=config.lr,
+                eval_interval_steps=config.eval_interval_steps,
                 enable_metrics=config.enable_metrics,
                 enable_vertex_tracking=config.enable_vertex_tracking,
             ),
@@ -835,6 +864,7 @@ def main():
                 prompts=metrics_prompts if is_main else None,
             )
 
+        train_target_steps = int(config.total_steps)
         resume_ckpt_path = resolve_resume_checkpoint(args.resume_from, config.ckpt_dir)
         if resume_ckpt_path:
             with log_stage("checkpoint_resume", path=resume_ckpt_path):
@@ -844,6 +874,45 @@ def main():
                         "resumed_from_final_checkpoint_without_step path=%s; "
                         "global_step remained 0 because final checkpoints omit training_step.",
                         resume_ckpt_path,
+                    )
+                resumed_step = int(trainer.global_step)
+                resume_additional_steps = max(0, int(args.resume_additional_steps))
+                resume_schedule = str(args.resume_schedule).strip().lower()
+                if resume_additional_steps > 0:
+                    train_target_steps = resumed_step + resume_additional_steps
+                    config.total_steps = train_target_steps
+                    trainer.total_steps = train_target_steps
+                    trainer.rebase_lr_schedule(anchor_step=resumed_step)
+                    LOGGER.info(
+                        "resume_schedule=additional resumed_step=%s additional_steps=%s target_total_steps=%s",
+                        resumed_step,
+                        resume_additional_steps,
+                        train_target_steps,
+                    )
+                elif resume_schedule == "restart":
+                    trainer.rebase_lr_schedule(anchor_step=resumed_step)
+                    LOGGER.info(
+                        "resume_schedule=restart resumed_step=%s target_total_steps=%s",
+                        resumed_step,
+                        train_target_steps,
+                    )
+                elif resume_schedule == "auto":
+                    if train_target_steps <= resumed_step:
+                        # Treat total_steps as continuation window when it is not ahead of resumed step.
+                        train_target_steps = resumed_step + max(1, train_target_steps)
+                        config.total_steps = train_target_steps
+                        trainer.total_steps = train_target_steps
+                    trainer.rebase_lr_schedule(anchor_step=resumed_step)
+                    LOGGER.info(
+                        "resume_schedule=auto resumed_step=%s target_total_steps=%s",
+                        resumed_step,
+                        train_target_steps,
+                    )
+                else:
+                    LOGGER.info(
+                        "resume_schedule=continue resumed_step=%s target_total_steps=%s",
+                        resumed_step,
+                        train_target_steps,
                     )
         elif args.resume_from:
             LOGGER.warning(
@@ -856,20 +925,20 @@ def main():
             with log_stage("checkpoint_patch", gcs_dir=AIP_CHECKPOINT_DIR):
                 patch_trainer_checkpointing(trainer, AIP_CHECKPOINT_DIR)
 
-        with log_stage("training", distributed=is_distributed, target_steps=config.total_steps):
+        with log_stage("training", distributed=is_distributed, target_steps=train_target_steps):
             if is_distributed:
                 trainer.train_distributed(
                     train_dataloader=train_loader,
                     val_dataloader=val_loader,
                     epochs=1,
-                    max_steps=config.total_steps
+                    max_steps=train_target_steps
                 )
             else:
                 trainer.train(
                     train_dataloader=train_loader,
                     val_dataloader=val_loader,
                     epochs=1,
-                    max_steps=config.total_steps
+                    max_steps=train_target_steps
                 )
 
         final_ckpt = None

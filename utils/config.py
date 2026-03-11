@@ -56,6 +56,7 @@ class TrainingConfig:
     # Logging 
     enable_logging: bool = True
     log_interval_steps: int = 500
+    eval_interval_steps: int = 1000
     log_per_iteration_time: bool = False
 
     # Experiment tracking and post-train prompt metrics

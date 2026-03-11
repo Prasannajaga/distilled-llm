@@ -1,0 +1,38 @@
+2026-03-11T11:46:44.824472 | [Trainer] Warning: Gradient checkpointing not supported by model
+2026-03-11T11:46:44.998987 | [Trainer] Model: 146.79M trainable / 146.79M total (100.0%)
+2026-03-11T11:46:44.999065 | [Trainer] Optimizer: ADAMW | LR: 1.20e-04 | Weight Decay: 0.1
+2026-03-11T11:46:44.999521 | [Trainer] GPU Memory: 0.62GB allocated | Device: cuda
+2026-03-11T11:46:44.999674 | [Trainer] Warning: TensorBoard writer unavailable (tensorboard not installed).
+2026-03-11T11:46:46.544284 | [Trainer] Loaded checkpoint from /home/prasanna/coding/distilled-llm/output/mini-math-teacher-v1-30K/checkpoints_model_30000.pt (step 30000)
+2026-03-11T12:01:02.927181 | [Trainer] step=  30100 | train_loss=  3.4062 | val_loss=  3.3405 | lr= 1.75e-05 | gnorm=  1.79 | iter_ms=    n/a
+2026-03-11T12:15:30.618155 | [Trainer] step=  30200 | train_loss=  3.4117 | val_loss=  3.3422 | lr= 1.72e-05 | gnorm=  1.89 | iter_ms=    n/a
+2026-03-11T12:30:06.971588 | [Trainer] step=  30300 | train_loss=  3.4170 | val_loss=  3.3419 | lr= 1.68e-05 | gnorm=  2.02 | iter_ms=    n/a
+2026-03-11T12:44:45.728412 | [Trainer] step=  30400 | train_loss=  3.4095 | val_loss=  3.3414 | lr= 1.65e-05 | gnorm=  1.83 | iter_ms=    n/a
+2026-03-11T12:58:59.859730 | [Trainer] step=  30500 | train_loss=  3.4066 | val_loss=  3.3401 | lr= 1.62e-05 | gnorm=  1.83 | iter_ms=    n/a
+2026-03-11T13:13:08.395736 | [Trainer] step=  30600 | train_loss=  3.4321 | val_loss=  3.3386 | lr= 1.58e-05 | gnorm=  1.74 | iter_ms=    n/a
+2026-03-11T13:27:16.058938 | [Trainer] step=  30700 | train_loss=  3.3991 | val_loss=  3.3379 | lr= 1.55e-05 | gnorm=  1.67 | iter_ms=    n/a
+2026-03-11T13:41:23.083438 | [Trainer] step=  30800 | train_loss=  3.4029 | val_loss=  3.3385 | lr= 1.52e-05 | gnorm=  1.80 | iter_ms=    n/a
+2026-03-11T13:55:29.632026 | [Trainer] step=  30900 | train_loss=  3.4069 | val_loss=  3.3364 | lr= 1.49e-05 | gnorm=  1.71 | iter_ms=    n/a
+2026-03-11T14:09:37.990737 | [Trainer] step=  31000 | train_loss=  3.4050 | val_loss=  3.3411 | lr= 1.46e-05 | gnorm=  1.72 | iter_ms=    n/a
+2026-03-11T14:23:49.075912 | [Trainer] step=  31100 | train_loss=  3.4066 | val_loss=  3.3390 | lr= 1.43e-05 | gnorm=  1.87 | iter_ms=    n/a
+2026-03-11T14:38:00.540768 | [Trainer] step=  31200 | train_loss=  3.3964 | val_loss=  3.3375 | lr= 1.40e-05 | gnorm=  1.93 | iter_ms=    n/a
+2026-03-11T14:52:14.025700 | [Trainer] step=  31300 | train_loss=  3.3933 | val_loss=  3.3383 | lr= 1.37e-05 | gnorm=  1.72 | iter_ms=    n/a
+2026-03-11T15:06:24.011253 | [Trainer] step=  31400 | train_loss=  3.4015 | val_loss=  3.3369 | lr= 1.34e-05 | gnorm=  1.86 | iter_ms=    n/a
+2026-03-11T15:20:40.624102 | [Trainer] step=  31500 | train_loss=  3.4085 | val_loss=  3.3347 | lr= 1.31e-05 | gnorm=  1.73 | iter_ms=    n/a
+2026-03-11T15:34:55.850277 | [Trainer] step=  31600 | train_loss=  3.4083 | val_loss=  3.3352 | lr= 1.28e-05 | gnorm=  1.64 | iter_ms=    n/a
+2026-03-11T15:49:14.530390 | [Trainer] step=  31700 | train_loss=  3.4095 | val_loss=  3.3334 | lr= 1.25e-05 | gnorm=  1.84 | iter_ms=    n/a
+2026-03-11T16:03:31.511341 | [Trainer] step=  31800 | train_loss=  3.4079 | val_loss=  3.3348 | lr= 1.22e-05 | gnorm=  1.66 | iter_ms=    n/a
+2026-03-11T16:17:41.878938 | [Trainer] step=  31900 | train_loss=  3.4163 | val_loss=  3.3354 | lr= 1.19e-05 | gnorm=  1.70 | iter_ms=    n/a
+2026-03-11T16:31:51.621446 | [Trainer] step=  32000 | train_loss=  3.3961 | val_loss=  3.3346 | lr= 1.16e-05 | gnorm=  1.73 | iter_ms=    n/a
+2026-03-11T16:45:59.988631 | [Trainer] step=  32100 | train_loss=  3.4108 | val_loss=  3.3345 | lr= 1.13e-05 | gnorm=  1.68 | iter_ms=    n/a
+2026-03-11T17:00:08.657505 | [Trainer] step=  32200 | train_loss=  3.4051 | val_loss=  3.3327 | lr= 1.11e-05 | gnorm=  1.75 | iter_ms=    n/a
+2026-03-11T17:14:16.996900 | [Trainer] step=  32300 | train_loss=  3.3920 | val_loss=  3.3320 | lr= 1.08e-05 | gnorm=  1.95 | iter_ms=    n/a
+2026-03-11T17:28:29.924854 | [Trainer] step=  32400 | train_loss=  3.4079 | val_loss=  3.3308 | lr= 1.05e-05 | gnorm=  1.77 | iter_ms=    n/a
+2026-03-11T17:42:43.324329 | [Trainer] step=  32500 | train_loss=  3.3992 | val_loss=  3.3325 | lr= 1.03e-05 | gnorm=  1.72 | iter_ms=    n/a
+2026-03-11T17:57:04.306220 | [Trainer] step=  32600 | train_loss=  3.4236 | val_loss=  3.3300 | lr= 1.00e-05 | gnorm=  1.68 | iter_ms=    n/a
+2026-03-11T18:11:23.313758 | [Trainer] step=  32700 | train_loss=  3.4049 | val_loss=  3.3316 | lr= 9.74e-06 | gnorm=  1.69 | iter_ms=    n/a
+2026-03-11T18:25:39.835025 | [Trainer] step=  32800 | train_loss=  3.3918 | val_loss=  3.3293 | lr= 9.48e-06 | gnorm=  1.70 | iter_ms=    n/a
+2026-03-11T18:39:50.909822 | [Trainer] step=  32900 | train_loss=  3.4200 | val_loss=  3.3304 | lr= 9.22e-06 | gnorm=  1.72 | iter_ms=    n/a
+2026-03-11T18:54:01.159575 | [Trainer] step=  33000 | train_loss=  3.4017 | val_loss=  3.3271 | lr= 8.97e-06 | gnorm=  1.68 | iter_ms=    n/a
+2026-03-11T19:08:10.788944 | [Trainer] step=  33100 | train_loss=  3.3959 | val_loss=  3.3306 | lr= 8.72e-06 | gnorm=  1.72 | iter_ms=    n/a
+2026-03-11T19:22:23.440580 | [Trainer] step=  33200 | train_loss=  3.4030 | val_loss=  3.3324 | lr= 8.48e-06 | gnorm=  1.57 | iter_ms=    n/a

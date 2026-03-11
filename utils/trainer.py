@@ -113,6 +113,7 @@ class Trainer:
         # bookkeeping
         self.global_step = 0  # increments after each optimizer.step()
         self._accum_counter = 0  
+        self._lr_schedule_anchor_step = 0
 
         # timer
         self._train_start_time = None
@@ -327,18 +328,25 @@ class Trainer:
  
 
     def _get_lr_factor(self, step: int) -> float: 
+        anchor = max(0, int(getattr(self, "_lr_schedule_anchor_step", 0)))
+        schedule_step = max(0, int(step) - anchor)
         if self.total_steps is None or self.total_steps <= 0:
             if self.warmup_steps > 0:
-                return min(1.0, float(step) / float(max(1, self.warmup_steps)))
+                return min(1.0, float(schedule_step) / float(max(1, self.warmup_steps)))
             return 1.0
 
-        step = min(step, self.total_steps)
-        if step < self.warmup_steps and self.warmup_steps > 0:
-            return float(step) / float(max(1, self.warmup_steps))
+        total_steps = int(self.total_steps)
+        if anchor > 0:
+            # When schedule is rebased at resume, decay only across the remaining window.
+            total_steps = max(1, total_steps - anchor)
+
+        schedule_step = min(schedule_step, total_steps)
+        if schedule_step < self.warmup_steps and self.warmup_steps > 0:
+            return float(schedule_step) / float(max(1, self.warmup_steps))
         
-        if self.total_steps == self.warmup_steps:
+        if total_steps == self.warmup_steps:
             return 1.0
-        progress = float(step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+        progress = float(schedule_step - self.warmup_steps) / float(max(1, total_steps - self.warmup_steps))
         progress = min(max(progress, 0.0), 1.0)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
@@ -346,6 +354,31 @@ class Trainer:
         factor = self._get_lr_factor(self.global_step)
         for base, group in zip(self._base_lrs, self.optimizer.param_groups):
             group["lr"] = base * factor
+
+    def rebase_lr_schedule(self, anchor_step: Optional[int] = None) -> None:
+        if anchor_step is None:
+            anchor_step = self.global_step
+        self._lr_schedule_anchor_step = max(0, int(anchor_step))
+        self._update_lr()
+        self._log(
+            f"[Trainer] Rebased LR schedule at step {self._lr_schedule_anchor_step} "
+            f"(total_steps={self.total_steps}, warmup_steps={self.warmup_steps})"
+        )
+
+    def _eval_interval_steps(self) -> int:
+        value = int(getattr(self.config, "eval_interval_steps", 0) or 0)
+        if value <= 0:
+            value = int(getattr(self.config, "log_interval_steps", 0) or 0)
+        return max(0, value)
+
+    def _maybe_clear_cuda_cache(self) -> None:
+        if self.device.type != "cuda":
+            return
+        interval = int(getattr(self.config, "clear_cache_interval", 0) or 0)
+        if interval <= 0:
+            return
+        if self.global_step > 0 and (self.global_step % interval == 0):
+            self._clear_cuda_cache()
  
     def parameter_counts(self) -> Dict[str, Any]:
         total = sum(p.numel() for p in self.model.parameters())
@@ -758,6 +791,7 @@ class Trainer:
             payload["training_step"] = step
             # Keep both keys for compatibility with state_dict()/load_state_dict() paths.
             payload["global_step"] = step
+        payload["lr_schedule_anchor_step"] = int(self._lr_schedule_anchor_step)
         # Persist config in checkpoint payload so resume does not depend on sidecar files.
         payload["config"] = asdict(self.config)
         
@@ -841,6 +875,7 @@ class Trainer:
             if match:
                 step_value = int(match.group(1))
         self.global_step = int(step_value or 0)
+        self._lr_schedule_anchor_step = int(data.get("lr_schedule_anchor_step", 0) or 0)
         saved_cfg = data.get("config", None)
 
         # fallback check if checkpoints not available there load config.json.
@@ -871,9 +906,7 @@ class Trainer:
         num_batches = int(num_batches or self.config.validation_batch_count)
         total_loss = 0.0
         seen = 0 
-        
-        self._clear_cuda_cache()
-        
+
         with torch.no_grad():
             for i, batch in enumerate(val_dataloader):
                 if seen >= num_batches:
@@ -887,8 +920,7 @@ class Trainer:
                 total_loss += loss.detach()
                 del inputs, targets, model_out, loss
                 seen += 1
-        
-        self._clear_cuda_cache()
+
         self.model.train()
         return (total_loss / max(1, seen)).item()
     
@@ -1048,6 +1080,7 @@ class Trainer:
         running_loss = 0.0
         loss_count = 0
         last_val_loss = None
+        eval_interval_steps = self._eval_interval_steps()
 
         stop_requested = False
         epoch = 0
@@ -1075,8 +1108,8 @@ class Trainer:
                         avg_loss = running_loss / loss_count
                         validated_this_step = False
 
-                        if val_dataloader is not None and self.config.validation_batch_count:
-                            if self.global_step % max(1, self.config.log_interval_steps) == 0:
+                        if val_dataloader is not None and self.config.validation_batch_count and eval_interval_steps > 0:
+                            if self.global_step % eval_interval_steps == 0:
                                 try:
                                     last_val_loss = self.estimate_validation_loss(
                                         val_dataloader,
@@ -1098,7 +1131,8 @@ class Trainer:
                         )
                         pbar.set_postfix(postfix)
                         pbar.update(1)
-                        current_val_loss = last_val_loss if validated_this_step else None
+                        # Keep reporting the latest known val loss between eval intervals.
+                        current_val_loss = last_val_loss
                         self._log_step_metrics(
                             step=self.global_step,
                             train_loss=avg_loss,
@@ -1137,14 +1171,13 @@ class Trainer:
                                 except Exception:
                                     self._log_exception("[Trainer] Warning: Checkpoint save failed")
 
+                        self._maybe_clear_cuda_cache()
+
                     # Stopping condition
                     if global_step_target is not None and self.global_step >= global_step_target:
                         stop_requested = True
                         break
                 
-                # Periodic memory cleanup 
-                self._clear_cuda_cache()
-
                 if stop_requested:
                     self._log(f"[Trainer] Stop requested ...")
                     break
@@ -1248,6 +1281,7 @@ class Trainer:
         running_loss = 0.0
         loss_count = 0
         last_val_loss = None
+        eval_interval_steps = self._eval_interval_steps()
 
         stop_requested = False
         epoch = 0
@@ -1276,8 +1310,13 @@ class Trainer:
 
                     if step_info["did_step"]:
                         validated_this_step = False
-                        if is_main and val_dataloader is not None and self.config.validation_batch_count:
-                            if self.global_step % max(1, self.config.log_interval_steps) == 0:
+                        if (
+                            is_main
+                            and val_dataloader is not None
+                            and self.config.validation_batch_count
+                            and eval_interval_steps > 0
+                        ):
+                            if self.global_step % eval_interval_steps == 0:
                                 try:
                                     val_loss = self.estimate_validation_loss(
                                         val_dataloader,
@@ -1307,7 +1346,8 @@ class Trainer:
                             )
                             pbar.set_postfix(postfix)
                             pbar.update(1)
-                            current_val_loss = last_val_loss if validated_this_step else None
+                            # Keep reporting the latest known val loss between eval intervals.
+                            current_val_loss = last_val_loss
                             self._log_step_metrics(
                                 step=self.global_step,
                                 train_loss=avg_loss,
@@ -1342,12 +1382,12 @@ class Trainer:
                                 except Exception:
                                     self._log_exception("[Trainer] Warning: Checkpoint save failed")
 
+                        self._maybe_clear_cuda_cache()
+
                     if global_step_target is not None and self.global_step >= global_step_target:
                         stop_requested = True
                         break
                 
-                self._clear_cuda_cache()
-
                 if stop_requested:
                     if is_main:
                         self._log(f"[Trainer] Stop requested ...")
@@ -1373,6 +1413,7 @@ class Trainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scaler_state_dict": getattr(self.scaler, "state_dict", lambda: None)(),
             "global_step": self.global_step,
+            "lr_schedule_anchor_step": int(self._lr_schedule_anchor_step),
             "config": asdict(self.config),
         }
         return state
@@ -1390,4 +1431,5 @@ class Trainer:
             except Exception:
                 pass
         self.global_step = int(state.get("global_step", 0))
+        self._lr_schedule_anchor_step = int(state.get("lr_schedule_anchor_step", 0) or 0)
         self._update_lr()
