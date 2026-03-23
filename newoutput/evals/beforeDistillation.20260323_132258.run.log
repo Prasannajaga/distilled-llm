@@ -1,0 +1,12 @@
+2026-03-23 18:53:01 | INFO | Starting run with args={'student_model': 'Qwen/Qwen2-0.5B-Instruct', 'teacher_model': 'Qwen/Qwen2-Math-1.5B-Instruct', 'dataset_path': '/media/prasanna/716F26140AED9B67/datasets/GSM8K', 'split': 'test', 'max_samples': 10, 'seed': 42, 'device': 'auto', 'dtype': 'auto', 'max_new_tokens': 128, 'temperature': 0.0, 'top_p': 1.0, 'repetition_penalty': 1.0, 'numeric_tolerance': 0.001, 'render_mode': 'auto', 'prompt_template': 'Question: {question}\nAnswer:', 'system_prompt': "You are a math assistant. Solve carefully and end with 'Final answer: <number>'.", 'output_dir': 'newoutput/evals/beforeDistillation.20260323_132258', 'download_retries': 50, 'download_retry_wait_sec': 20, 'local_files_only': False, 'debug': True, 'log_interval_samples': 10}
+2026-03-23 18:53:01 | INFO | Resolving dataset split file for split='test' from '/media/prasanna/716F26140AED9B67/datasets/GSM8K'
+2026-03-23 18:53:01 | INFO | Loading dataset from /media/prasanna/716F26140AED9B67/datasets/openai___gsm8k/main/0.0.0/cc7b047b6e5bb11b4f1af84efc572db110a51b3c/gsm8k-test.arrow
+2026-03-23 18:53:01 | INFO | Loaded arrow with 1319 rows
+2026-03-23 18:53:01 | INFO | Resolved device=cuda dtype=torch.bfloat16
+2026-03-23 18:53:01 | INFO | Starting eval for label=teacher model=Qwen/Qwen2-Math-1.5B-Instruct
+2026-03-23 18:53:01 | INFO | Loading model 'Qwen/Qwen2-Math-1.5B-Instruct'...
+2026-03-23 18:53:01 | INFO | Resolving model snapshot: model_id=Qwen/Qwen2-Math-1.5B-Instruct local_files_only=False retries=50 wait_s=20
+2026-03-23 18:53:01 | INFO | Snapshot download attempt 1/50 for Qwen/Qwen2-Math-1.5B-Instruct
+/home/prasanna/coding/distilled-llm/.venv/lib/python3.10/site-packages/huggingface_hub/utils/_validators.py:186: UserWarning: The `resume_download` argument is deprecated and ignored in `snapshot_download`. Downloads always resume whenever possible.
+  warnings.warn(
+2026-03-23 18:53:01 | DEBUG | connect_tcp.started host='huggingface.co' port=443 local_address=None timeout=None socket_options=None
