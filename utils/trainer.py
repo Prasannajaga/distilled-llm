@@ -476,8 +476,6 @@ class Trainer:
         val_loss: Optional[float],
         iter_time_s: Optional[float],
     ) -> None:
-        if not self.step_metrics_path:
-            return
         payload = {
             "ts": datetime.utcnow().isoformat() + "Z",
             "step": int(step),
@@ -487,11 +485,12 @@ class Trainer:
             "grad_norm": float(grad_norm) if grad_norm is not None else None,
             "iter_time_ms": (float(iter_time_s) * 1000.0) if iter_time_s is not None else None,
         }
-        try:
-            with open(self.step_metrics_path, "a", encoding="utf-8") as fp:
-                fp.write(json.dumps(payload) + "\n")
-        except Exception:
-            pass
+        if self.step_metrics_path:
+            try:
+                with open(self.step_metrics_path, "a", encoding="utf-8") as fp:
+                    fp.write(json.dumps(payload) + "\n")
+            except Exception:
+                pass
         self._track_vertex_event("step_metrics", payload)
         metrics_for_vertex = {
             "train_loss": float(train_loss),

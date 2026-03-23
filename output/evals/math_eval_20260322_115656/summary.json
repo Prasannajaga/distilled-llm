@@ -1,0 +1,40 @@
+{
+  "created_at_utc": "2026-03-22T11:56:56.212405+00:00",
+  "dataset_source": "data/math_eval_100.jsonl",
+  "model": {
+    "output_dir": "output/mini-math-teacher-sft-8K",
+    "checkpoint_path": "output/mini-math-teacher-sft-8K/final_ckpt_43000.pt",
+    "parameters": "146.790432 M"
+  },
+  "settings": {
+    "max_new_tokens": 16,
+    "temperature": 0.0,
+    "top_k": null,
+    "repetition_penalty": 1.0,
+    "stop_on_eos": 1,
+    "render_mode": "auto",
+    "numeric_tolerance": 0.001
+  },
+  "summary": {
+    "num_samples": 1,
+    "normalized_exact_match_accuracy": 0.0,
+    "numeric_total": 1,
+    "numeric_within_tolerance_accuracy": 0.0,
+    "avg_abs_numeric_error": 10.0,
+    "avg_generated_tokens": 16.0,
+    "truncation_rate": 1.0,
+    "empty_prediction_rate": 0.0,
+    "avg_latency_ms": 797.4625730000184,
+    "tokens_per_second": 20.063637519449617,
+    "chat_render_rate": 0.0,
+    "plain_render_rate": 1.0
+  },
+  "category_metrics": {
+    "addition": {
+      "total": 1,
+      "normalized_exact_match_accuracy": 0.0,
+      "numeric_total": 1,
+      "numeric_within_tolerance_accuracy": 0.0
+    }
+  }
+}

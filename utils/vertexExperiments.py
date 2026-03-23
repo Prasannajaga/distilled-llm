@@ -325,6 +325,7 @@ class VertexExperiments:
             return
         self._vertex_tracking_finalized = True
         if not self.enabled:
+            self._close_tensorboard()
             return
 
         payload: Dict[str, Any] = {

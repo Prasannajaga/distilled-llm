@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import struct
@@ -59,6 +60,7 @@ class PackedDatasetBuilder:
         self.packed: np.ndarray | None = None
         self._total_tokens: int = 0
         self._total_sequences: int = 0
+        self._last_sft_summary: dict[str, Any] | None = None
  
     #  Public API                                                     
     @property
@@ -84,6 +86,20 @@ class PackedDatasetBuilder:
         self.packed = None
         self._tokenize_and_save(dataset)
         return self
+
+    def build_sft_from_hf_dataset(
+        self,
+        dataset: Any,
+        sft_config: Optional[dict[str, Any]] = None,
+    ) -> PackedDatasetBuilder:
+        """Build SFT-packed tokens from a Hugging Face dataset object."""
+        self.packed = None
+        self._tokenize_and_save_sft(dataset, sft_config or {})
+        return self
+
+    @property
+    def last_sft_summary(self) -> dict[str, Any] | None:
+        return self._last_sft_summary
 
     @staticmethod
     def to_dataloader(
@@ -445,6 +461,189 @@ class PackedDatasetBuilder:
         print(f"[PACK]   {bin_path}")
         print(f"[PACK]   {idx_path}")
 
+    def _tokenize_and_save_sft(self, dataset: Any, sft_config: dict[str, Any]) -> None:
+        use_batch = self._supports_encode_batch(self.tokenizer)
+        mode = "batch" if use_batch else "sequential"
+        out_dtype = self._resolve_output_dtype(self.tokenizer, self.token_dtype)
+        dtype_code = 2 if out_dtype == np.dtype(np.uint16) else 4
+        print(
+            f"[PACK:SFT] Tokenizing: mode={mode}, "
+            f"workers={self.num_workers}, batch_size={self.batch_size}, "
+            f"dtype={out_dtype}, tbin_header={self.use_tbin_header}"
+        )
+
+        t_start = time.monotonic()
+        total_tokens = 0
+        written_tokens = 0
+        n_rows = len(dataset)
+        processed = 0
+        carry = np.array([], dtype=np.uint32)
+        write_buffer: list[np.ndarray] = []
+        buffer_len = 0
+
+        kept_rows = 0
+        skipped_rows = 0
+        skip_reasons: dict[str, int] = {}
+        rendered_native = 0
+        rendered_fallback = 0
+
+        def _mark_skip(reason: str) -> None:
+            nonlocal skipped_rows
+            skipped_rows += 1
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
+        bin_path = self.output_path / "sft.bin"
+        idx_path = self.output_path / "sft.idx"
+        summary_path = self.output_path / "sft_dataset_build_summary.json"
+
+        with open(bin_path, "wb") as f:
+            if self.use_tbin_header:
+                f.write(HEADER_MAGIC)
+                f.write(struct.pack("<I", HEADER_VERSION))
+                f.write(struct.pack("<I", self.block_size))
+                f.write(struct.pack("<I", dtype_code))
+
+            for batch_start in range(0, n_rows, self.batch_size):
+                batch_end = min(batch_start + self.batch_size, n_rows)
+                rows = dataset[batch_start:batch_end]
+                rendered_texts: list[str] = []
+
+                for i in range(batch_end - batch_start):
+                    row = {k: rows[k][i] for k in rows}
+                    processed += 1
+
+                    messages, reason = self._sft_row_to_messages(row, sft_config)
+                    if messages is None:
+                        _mark_skip(reason or "invalid_row")
+                        continue
+
+                    rendered_text, renderer = self._render_sft_messages(messages)
+                    rendered_text = rendered_text.strip()
+                    if not rendered_text:
+                        _mark_skip("empty_rendered_text")
+                        continue
+
+                    if renderer == "native":
+                        rendered_native += 1
+                    else:
+                        rendered_fallback += 1
+                    rendered_texts.append(rendered_text)
+
+                if not rendered_texts:
+                    continue
+
+                if use_batch:
+                    all_ids = self._encode_batch(self.tokenizer, rendered_texts)
+                else:
+                    all_ids = [self.tokenizer.encode(t) for t in rendered_texts]
+
+                flat: list[int] = []
+                for ids in all_ids:
+                    if not ids:
+                        _mark_skip("empty_token_ids")
+                        continue
+                    flat.extend(ids)
+                    flat.append(self.eos_id)
+                    kept_rows += 1
+
+                if not flat:
+                    continue
+
+                batch_tokens = np.asarray(flat, dtype=np.uint32)
+                total_tokens += int(batch_tokens.size)
+
+                if carry.size > 0:
+                    batch_tokens = np.concatenate((carry, batch_tokens))
+                    carry = np.array([], dtype=np.uint32)
+
+                full_len = (len(batch_tokens) // self.block_size) * self.block_size
+                if full_len > 0:
+                    to_write = batch_tokens[:full_len]
+                    if out_dtype == np.dtype(np.uint16):
+                        if int(to_write.max()) > np.iinfo(np.uint16).max:
+                            raise ValueError(
+                                "Encountered token id > 65535 while writing uint16. "
+                                "Set token_dtype='uint32'."
+                            )
+                    write_buffer.append(to_write.astype(out_dtype, copy=False))
+                    buffer_len += full_len
+                    written_tokens += full_len
+
+                    if buffer_len >= _FLUSH_THRESHOLD:
+                        merged = np.concatenate(write_buffer)
+                        f.write(merged.tobytes())
+                        write_buffer.clear()
+                        buffer_len = 0
+
+                rem_len = len(batch_tokens) - full_len
+                carry = (
+                    batch_tokens[full_len:].copy()
+                    if rem_len > 0
+                    else np.array([], dtype=np.uint32)
+                )
+
+                if processed % (self.batch_size * 10) < self.batch_size:
+                    elapsed = time.monotonic() - t_start
+                    rps = processed / elapsed if elapsed > 0 else 0
+                    print(
+                        f"[PACK:SFT] {processed:>8,}/{n_rows:,} rows | "
+                        f"kept={kept_rows:>8,} skipped={skipped_rows:>8,} | "
+                        f"{total_tokens:>12,} tokens | "
+                        f"{rps:>6.0f} rows/s | "
+                        f"{elapsed:>6.1f}s"
+                    )
+
+            if write_buffer:
+                merged = np.concatenate(write_buffer)
+                f.write(merged.tobytes())
+                write_buffer.clear()
+                buffer_len = 0
+
+        n_sequences = written_tokens // self.block_size
+        offsets = np.arange(
+            0, n_sequences * self.block_size, self.block_size, dtype=np.uint64
+        )
+        offsets.tofile(str(idx_path))
+
+        self._total_tokens = written_tokens
+        self._total_sequences = n_sequences
+
+        elapsed = time.monotonic() - t_start
+        if carry.size > 0:
+            print(f"[PACK:SFT] Dropped trailing {carry.size:,} tokens to keep full blocks")
+
+        summary = {
+            "schema_version": 1,
+            "mode": "sft",
+            "dataset_name": self.dataset_name,
+            "block_size": self.block_size,
+            "batch_size": self.batch_size,
+            "output_bin": str(bin_path),
+            "output_idx": str(idx_path),
+            "processed_rows": processed,
+            "kept_rows": kept_rows,
+            "skipped_rows": skipped_rows,
+            "skip_reasons": skip_reasons,
+            "rendered_native_rows": rendered_native,
+            "rendered_fallback_rows": rendered_fallback,
+            "total_tokens_unpacked": total_tokens,
+            "packed_total_tokens": written_tokens,
+            "total_sequences": n_sequences,
+            "elapsed_seconds": round(elapsed, 3),
+        }
+        summary_path.write_text(json.dumps(summary, indent=2))
+        self._last_sft_summary = summary
+
+        print(
+            f"[PACK:SFT] Done: processed={processed:,} rows, kept={kept_rows:,}, "
+            f"skipped={skipped_rows:,}, sequences={n_sequences:,} in {elapsed:.1f}s"
+        )
+        bin_mb = bin_path.stat().st_size / (1024 * 1024)
+        print(f"[PACK:SFT] Saved {bin_mb:.1f} MB:")
+        print(f"[PACK:SFT]   {bin_path}")
+        print(f"[PACK:SFT]   {idx_path}")
+        print(f"[PACK:SFT]   {summary_path}")
+
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                   #
     # ------------------------------------------------------------------ #
@@ -468,6 +667,107 @@ class PackedDatasetBuilder:
                 return list(pool.map(_extract_text, args, chunksize=64))
 
         return [(r.get(text_column) or "").strip() for r in row_dicts]
+
+    def _sft_row_to_messages(
+        self,
+        row: dict[str, Any],
+        sft_config: dict[str, Any],
+    ) -> tuple[Optional[list[dict[str, str]]], Optional[str]]:
+        messages_column = str(sft_config.get("messages_column", "messages"))
+        prompt_column = str(sft_config.get("prompt_column", "prompt"))
+        response_column = str(sft_config.get("response_column", "response"))
+        system_column = str(sft_config.get("system_column", "system_prompt"))
+        default_system_prompt = str(sft_config.get("system_prompt", "") or "").strip()
+
+        raw_messages = row.get(messages_column)
+        messages = self._coerce_messages(raw_messages)
+        if messages is not None and len(messages) > 0:
+            system_prompt = row.get(system_column)
+            system_text = (
+                str(system_prompt).strip()
+                if isinstance(system_prompt, str)
+                else default_system_prompt
+            )
+            if system_text and not any(m["role"] == "system" for m in messages):
+                messages = [{"role": "system", "content": system_text}, *messages]
+            return messages, None
+
+        prompt = row.get(prompt_column)
+        response = row.get(response_column)
+        prompt_text = str(prompt).strip() if isinstance(prompt, str) else ""
+        response_text = str(response).strip() if isinstance(response, str) else ""
+        if not prompt_text:
+            return None, "missing_prompt"
+        if not response_text:
+            return None, "missing_response"
+
+        system_prompt = row.get(system_column)
+        system_text = (
+            str(system_prompt).strip()
+            if isinstance(system_prompt, str)
+            else default_system_prompt
+        )
+
+        mapped: list[dict[str, str]] = []
+        if system_text:
+            mapped.append({"role": "system", "content": system_text})
+        mapped.append({"role": "user", "content": prompt_text})
+        mapped.append({"role": "assistant", "content": response_text})
+        return mapped, None
+
+    @staticmethod
+    def _coerce_messages(raw_messages: Any) -> Optional[list[dict[str, str]]]:
+        if not isinstance(raw_messages, list):
+            return None
+        out: list[dict[str, str]] = []
+        for item in raw_messages:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role")
+            content = item.get("content")
+            if not isinstance(role, str) or not isinstance(content, str):
+                continue
+            role_norm = role.strip().lower()
+            content_norm = content.strip()
+            if not role_norm or not content_norm:
+                continue
+            if role_norm not in {"system", "user", "assistant"}:
+                role_norm = "user"
+            out.append({"role": role_norm, "content": content_norm})
+        return out
+
+    def _render_sft_messages(self, messages: list[dict[str, str]]) -> tuple[str, str]:
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                rendered = self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+                return str(rendered), "native"
+            except TypeError:
+                try:
+                    rendered = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                    )
+                    return str(rendered), "native"
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return self._fallback_render_messages(messages), "fallback"
+
+    @staticmethod
+    def _fallback_render_messages(messages: list[dict[str, str]]) -> str:
+        chunks: list[str] = []
+        for message in messages:
+            role = str(message.get("role", "user")).strip().lower() or "user"
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            chunks.append(f"<|{role}|>\n{content}\n")
+        return "".join(chunks).strip()
 
     @staticmethod
     def _resolve_eos(tokenizer: Any) -> int:

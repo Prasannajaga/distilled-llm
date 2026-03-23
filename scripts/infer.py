@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_new_tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
+    parser.add_argument("--stop_on_eos", type=int, choices=[0, 1], default=None)
     parser.add_argument("--repetition_penalty", type=float, default=None) 
     parser.add_argument(
         "prompt",
@@ -92,7 +93,8 @@ def _extract_step(path: Path) -> int:
 
 def find_checkpoint(output_dir: Path, explicit_checkpoint: str | None) -> Path:
     if explicit_checkpoint:
-        checkpoint = Path(str(output_dir) + "/" + explicit_checkpoint)
+        candidate = Path(explicit_checkpoint).expanduser()
+        checkpoint = candidate if candidate.is_absolute() else (output_dir / candidate)
         if not checkpoint.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
         return checkpoint
@@ -155,6 +157,8 @@ def apply_inference_overrides(config: TrainingConfig, args: argparse.Namespace) 
     if args.top_k is not None:
         config.use_top_k = True
         config.top_k = args.top_k
+    if args.stop_on_eos is not None:
+        config.stop_on_eos = bool(args.stop_on_eos)
     if args.repetition_penalty is not None:
         config.use_repetition_penalty = True
         config.repetition_penalty = args.repetition_penalty
@@ -172,40 +176,110 @@ def build_model(config: TrainingConfig, vocab_size: int) -> GQATransformer:
     )
 
 
+def _as_batched_input_ids(inputs: Any, device: torch.device, tokenizer: Any | None = None) -> torch.Tensor:
+    def _encode_text(text: str) -> Any:
+        if tokenizer is None:
+            raise TypeError("String input payload requires a tokenizer for encoding.")
+        try:
+            return tokenizer.encode(text, return_tensors="pt")
+        except TypeError:
+            return tokenizer.encode(text)
+
+    if isinstance(inputs, dict):
+        if "input_ids" in inputs:
+            inputs = inputs["input_ids"]
+        elif "text" in inputs:
+            inputs = _encode_text(str(inputs["text"]))
+        elif "prompt" in inputs:
+            inputs = _encode_text(str(inputs["prompt"]))
+    if isinstance(inputs, str):
+        inputs = _encode_text(inputs)
+
+    if not isinstance(inputs, torch.Tensor) and hasattr(inputs, "input_ids"):
+        inputs = getattr(inputs, "input_ids")
+
+    if isinstance(inputs, (list, tuple)) and inputs:
+        first = inputs[0]
+        if isinstance(first, str):
+            if tokenizer is not None and hasattr(tokenizer, "convert_tokens_to_ids"):
+                token_ids = tokenizer.convert_tokens_to_ids(list(inputs))
+                if isinstance(token_ids, list) and token_ids and all(isinstance(t, int) for t in token_ids):
+                    inputs = token_ids
+                else:
+                    inputs = _encode_text(" ".join(str(t) for t in inputs))
+            else:
+                inputs = _encode_text(" ".join(str(t) for t in inputs))
+        elif isinstance(first, (list, tuple)) and first and isinstance(first[0], str):
+            if tokenizer is not None and hasattr(tokenizer, "convert_tokens_to_ids"):
+                converted_rows = []
+                ok = True
+                for row in inputs:
+                    row_ids = tokenizer.convert_tokens_to_ids(list(row))
+                    if not isinstance(row_ids, list) or not all(isinstance(t, int) for t in row_ids):
+                        ok = False
+                        break
+                    converted_rows.append(row_ids)
+                inputs = converted_rows if ok else [_encode_text(" ".join(str(t) for t in row)) for row in inputs]
+            else:
+                inputs = [_encode_text(" ".join(str(t) for t in row)) for row in inputs]
+
+    if not isinstance(inputs, torch.Tensor):
+        try:
+            inputs = torch.tensor([inputs], dtype=torch.long)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"Unsupported tokenizer output type for input_ids conversion: {type(inputs)!r}"
+            ) from exc
+    if inputs.dim() == 1:
+        inputs = inputs.unsqueeze(0)
+    return inputs.to(device)
+
+
 def prepare_input_ids(tokenizer: Any, prompt: str, device: torch.device) -> torch.Tensor:
-    input_ids = tokenizer.encode(prompt, return_tensors="pt")
-    if not isinstance(input_ids, torch.Tensor):
-        input_ids = torch.tensor([input_ids], dtype=torch.long)
-    if input_ids.dim() == 1:
-        input_ids = input_ids.unsqueeze(0)
-    return input_ids.to(device)
+    try:
+        input_ids = tokenizer.encode(prompt, return_tensors="pt")
+    except TypeError:
+        input_ids = tokenizer.encode(prompt)
+    return _as_batched_input_ids(input_ids, device, tokenizer=tokenizer)
 
 
-def format_latex(text: str) -> str:
-    out = text
-    out = re.sub(r"\\begin\{[^}]+\}", "", out)
-    out = re.sub(r"\\end\{[^}]+\}", "", out)
-    out = re.sub(r"\\label\{[^}]+\}", "", out)
-    out = re.sub(r"\\(?:frac|sqrt)\{([^}]*)\}\{([^}]*)\}", r"(\1/\2)", out)
-    out = re.sub(r"\\(?:text|mathrm|mathbf|mathit|mathbb|operatorname)\{([^}]*)\}", r"\1", out)
-    out = re.sub(r"\\(?:left|right|Big|big|bigg|Bigg)", "", out)
-    out = re.sub(r"\\(alpha|beta|gamma|delta|epsilon|theta|lambda|mu|sigma|pi|phi|psi|omega)", r"\1", out)
-    out = re.sub(r"\\(sin|cos|tan|log|ln|exp|min|max|lim|inf|sup|sum|prod|int)", r"\1", out)
-    out = re.sub(r"\\(leq|geq|neq|approx|equiv|sim)", lambda m: {"leq": "<=", "geq": ">=", "neq": "!=", "approx": "≈", "equiv": "≡", "sim": "~"}.get(m.group(1), m.group(0)), out)
-    out = re.sub(r"\\(cdot|times|div)", lambda m: {"cdot": "·", "times": "×", "div": "÷"}.get(m.group(1), m.group(0)), out)
-    out = re.sub(r"\\(in|notin|subset|supset|cup|cap)", lambda m: {"in": "∈", "notin": "∉", "subset": "⊂", "supset": "⊃", "cup": "∪", "cap": "∩"}.get(m.group(1), m.group(0)), out)
-    out = re.sub(r"\\(rightarrow|leftarrow|Rightarrow|Leftarrow|infty)", lambda m: {"rightarrow": "→", "leftarrow": "←", "Rightarrow": "⇒", "Leftarrow": "⇐", "infty": "∞"}.get(m.group(1), m.group(0)), out)
-    out = re.sub(r"\\[a-zA-Z]+\*?", " ", out)
-    out = re.sub(r"\$+", "", out)
-    out = re.sub(r"([^^])\^\{([^}]*)\}", r"\1^(\2)", out)
-    out = re.sub(r"_\{([^}]*)\}", r"_\1", out)
-    out = re.sub(r"[{}]", "", out)
-    out = re.sub(r"&", " ", out)
-    out = re.sub(r"\\{2,}", "\n", out)
-    out = re.sub(r"\\\s", " ", out)
-    out = re.sub(r"[ \t]+", " ", out)
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    return out.strip()
+def prepare_chat_input_ids(tokenizer: Any, prompt: str, device: torch.device) -> torch.Tensor:
+    if not hasattr(tokenizer, "apply_chat_template"):
+        return prepare_input_ids(tokenizer, prompt, device)
+
+    try:
+        inputs = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+    except Exception:
+        return prepare_input_ids(tokenizer, prompt, device)
+
+    return _as_batched_input_ids(inputs, device, tokenizer=tokenizer)
+
+
+def load_state_dict_with_tril_fallback(model: torch.nn.Module, state_dict: dict[str, Any]) -> None:
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        return
+    except RuntimeError as exc:
+        message = str(exc)
+        if ".attn.tril" not in message or "size mismatch" not in message:
+            raise
+
+    # Allow block_size changes by skipping cached causal-mask buffers only.
+    filtered_state_dict = {k: v for k, v in state_dict.items() if not k.endswith(".attn.tril")}
+    incompatible = model.load_state_dict(filtered_state_dict, strict=False)
+    missing = [k for k in incompatible.missing_keys if not k.endswith(".attn.tril")]
+    unexpected = list(incompatible.unexpected_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint load fallback failed. "
+            f"missing_non_tril={missing}, unexpected={unexpected}"
+        )
+    print("[CKPT] Loaded with tril-buffer fallback (block_size differs from checkpoint).")
 
 
 def stream_to_stdout(token_stream: Iterator[str]) -> str:
@@ -214,12 +288,7 @@ def stream_to_stdout(token_stream: Iterator[str]) -> str:
         print(chunk, end="", flush=True)
         chunks.append(chunk)
     print()
-    raw = "".join(chunks)
-    cleaned = format_latex(raw)
-    if cleaned != raw:
-        print("\n--- Formatted ---")
-        print(cleaned)
-    return cleaned
+    return "".join(chunks)
 
 
 def interactive_loop(
@@ -240,9 +309,11 @@ def interactive_loop(
             print("Exiting.")
             break
 
-        input_ids = prepare_input_ids(tokenizer, prompt, engine.device)
+        input_ids = prepare_chat_input_ids(tokenizer, prompt, engine.device)
         print("assistant> ", end="", flush=True)
-        stream_to_stdout(engine.stream_generate(input_ids))
+        text = stream_to_stdout(engine.stream_generate(input_ids))
+        if not text.strip():
+            print("[WARN] Empty generation (likely hit EOS immediately). Try a different prompt or higher temperature.")
 
 
 def main() -> None:
@@ -254,8 +325,7 @@ def main() -> None:
     config = load_saved_config(output_dir)
     apply_inference_overrides(config, args)
 
-    requested_device = args.device if args.device != "auto" else "auto"
-    device = get_device(requested_device)
+    device = get_device(args.device)
     if device.type != "cuda":
         config.use_amp = False
 
@@ -264,7 +334,7 @@ def main() -> None:
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint.get("model_state_dict", checkpoint)
-    model.load_state_dict(state_dict, strict=True)
+    load_state_dict_with_tril_fallback(model, state_dict)
     print(f"[MODEL] parameters={params(model)}") 
     model.eval()
 
@@ -275,8 +345,10 @@ def main() -> None:
     print(f"[DEVICE] {device}")
     if args.prompt:
         prompt = " ".join(args.prompt)
-        input_ids = prepare_input_ids(tokenizer, prompt, device)
-        stream_to_stdout(engine.stream_generate(input_ids))
+        input_ids = prepare_chat_input_ids(tokenizer, prompt, device)
+        text = stream_to_stdout(engine.stream_generate(input_ids))
+        if not text.strip():
+            print("[WARN] Empty generation (likely hit EOS immediately). Try --temperature 0.9 --top_k 100.")
         return
 
     interactive_loop(engine, tokenizer)

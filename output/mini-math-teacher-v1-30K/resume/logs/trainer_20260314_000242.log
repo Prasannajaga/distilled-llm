@@ -1,0 +1,6 @@
+2026-03-14T05:32:42.956409 | [Trainer] Warning: Gradient checkpointing not supported by model
+2026-03-14T05:32:42.957880 | [Trainer] Model: 146.79M trainable / 146.79M total (100.0%)
+2026-03-14T05:32:42.957930 | [Trainer] Optimizer: ADAMW | LR: 1.10e-04 | Weight Decay: 0.1
+2026-03-14T05:32:42.958055 | [Trainer] Warning: TensorBoard writer unavailable (tensorboard not installed).
+2026-03-14T05:32:44.182745 | [Trainer] Loaded checkpoint from /home/prasanna/coding/distilled-llm/output/mini-math-teacher-v1-30K/resume/model_35000.pt (step 35000)
+2026-03-14T05:32:44.197014 | [Trainer] Rebased LR schedule at step 35000 (total_steps=40000, warmup_steps=300)

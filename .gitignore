@@ -9,8 +9,7 @@ wheels/
 # Virtual environments
 .venv
 output/*.pt
-dist/
-data/
+dist/ 
 test.py
 *.bin
 *.idx

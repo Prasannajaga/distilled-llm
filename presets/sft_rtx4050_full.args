@@ -1,0 +1,57 @@
+# Local preset for scripts.train_vertex (RTX 4050, full SFT)
+#
+# Usage:
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+# uv run python -m scripts.train_vertex $(awk '!/^($|#)/{printf "%s ",$0}' presets/sft_rtx4050_full.args)
+#
+# Notes:
+# - This assumes your SFT-packed data was built as sft.bin.
+# - Keep --block_size aligned with the packing block size.
+# - Designed for single-GPU 4050 memory constraints (full model finetune).
+
+--bin_path /media/prasanna/716F26140AED9B67/datasets/sft2.bin
+--device cuda
+--seed 42
+--num_workers 4
+
+# Model (teacher-size full SFT)
+--n_layer 18
+--n_embd 768
+--n_head 16
+--block_size 1024
+
+# Batching tuned for 4050 VRAM
+--train_batch_size 1
+--eval_batch_size 1
+--grad_accum_steps 32
+--validation_batch_count 20
+--val_ratio 0.05
+
+# Optimizer / schedule (SFT-friendly)
+--optimizer adamw
+--lr 8e-05
+--eps 1e-8
+--weight_decay 0.01
+--grad_clip_norm 1.0
+--use_amp 1
+--amp_dtype float16
+--enable_gradient_checkpointing 1
+--total_steps 8000
+--warmup_steps 300
+
+# Logging / checkpoints
+--ckpt_dir ./output/mini-math-teacher-sft-8K
+--ckpt_interval_steps 4000
+--save_optimizer_state 1
+--log_interval_steps 100
+--eval_interval_steps 200
+--enable_tensorboard 1
+--tensorboard_hist_interval_steps 1000
+--enable_vertex 0
+--enable_metrics 0 
+
+# Resume from BASE pretrained checkpoint for SFT (required for true SFT).
+# Update this path to your base model checkpoint if different.
+--resume_from ./output/mini-math-teacher-sft-8K/model_40000.pt
+--resume_schedule auto
+--resume_additional_steps 8000

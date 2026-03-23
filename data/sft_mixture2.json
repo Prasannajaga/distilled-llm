@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Open-Orca/OpenOrca",
+    "split": "train",
+    "prompt_column": "question",
+    "response_column": "response",
+    "system_prompt": "You are a careful math tutor. Show concise reasoning and then give the final answer."
+  },
+  {
+    "name": "meta-math/MetaMathQA",
+    "split": "train",
+    "prompt_column": "query",
+    "response_column": "response",
+    "system_prompt": "You are a careful math tutor. Show concise reasoning and then give the final answer."
+  }
+]

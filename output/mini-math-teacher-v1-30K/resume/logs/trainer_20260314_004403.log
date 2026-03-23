@@ -1,0 +1,16 @@
+2026-03-14T06:14:03.728222 | [Trainer] Warning: Gradient checkpointing not supported by model
+2026-03-14T06:14:03.900190 | [Trainer] Model: 146.79M trainable / 146.79M total (100.0%)
+2026-03-14T06:14:03.900269 | [Trainer] Optimizer: ADAMW | LR: 2.10e-04 | Weight Decay: 0.1
+2026-03-14T06:14:03.900737 | [Trainer] GPU Memory: 0.62GB allocated | Device: cuda
+2026-03-14T06:14:03.900918 | [Trainer] Warning: TensorBoard writer unavailable (tensorboard not installed).
+2026-03-14T06:14:04.524682 | [Trainer] Loaded checkpoint from /home/prasanna/coding/distilled-llm/output/mini-math-teacher-v1-30K/resume/model_35000.pt (step 35000)
+2026-03-14T06:14:04.524948 | [Trainer] Rebased LR schedule at step 35000 (total_steps=37500, warmup_steps=300)
+2026-03-14T06:28:17.601392 | [Trainer] step=  35100 | train_loss=  3.3883 | val_loss=  3.3797 | lr= 7.00e-05 | gnorm=  2.09 | iter_ms=    n/a
+2026-03-14T06:42:29.998580 | [Trainer] step=  35200 | train_loss=  3.4820 | val_loss=  3.4664 | lr= 1.40e-04 | gnorm=  2.81 | iter_ms=    n/a
+2026-03-14T06:56:43.941978 | [Trainer] step=  35300 | train_loss=  3.6000 | val_loss=  3.5645 | lr= 2.10e-04 | gnorm=  3.61 | iter_ms=    n/a
+2026-03-14T07:10:58.518819 | [Trainer] step=  35400 | train_loss=  3.6730 | val_loss=  3.6176 | lr= 2.09e-04 | gnorm=  3.95 | iter_ms=    n/a
+2026-03-14T07:25:12.921495 | [Trainer] step=  35500 | train_loss=  3.6879 | val_loss=  3.6045 | lr= 2.06e-04 | gnorm=  2.00 | iter_ms=    n/a
+2026-03-14T07:39:27.573782 | [Trainer] step=  35600 | train_loss=  3.7102 | val_loss=  3.6173 | lr= 2.01e-04 | gnorm=  1.59 | iter_ms=    n/a
+2026-03-14T07:53:42.216304 | [Trainer] step=  35700 | train_loss=  3.6703 | val_loss=  3.5996 | lr= 1.93e-04 | gnorm=  1.65 | iter_ms=    n/a
+2026-03-14T08:07:56.394279 | [Trainer] step=  35800 | train_loss=  3.6681 | val_loss=  3.5816 | lr= 1.84e-04 | gnorm=  1.61 | iter_ms=    n/a
+2026-03-14T08:22:11.487746 | [Trainer] step=  35900 | train_loss=  3.6557 | val_loss=  3.5701 | lr= 1.74e-04 | gnorm=  1.56 | iter_ms=    n/a

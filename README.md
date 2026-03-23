@@ -51,7 +51,17 @@ python -m scripts.train_pretrain \
 python -m scripts.infer --output ./output/<model-dir> "hello"
 ```
 
-### 3) Vertex deployment
+### 3) Local math eval (single checkpoint)
+
+```bash
+python -m scripts.math_eval \
+  --output ./output/<model-dir> \
+  --eval-file ./data/math_eval_100.jsonl \
+  --temperature 0 \
+  --max_new_tokens 32
+```
+
+### 4) Vertex deployment
 
 ```bash
 python deploy.py \
@@ -64,7 +74,7 @@ python deploy.py \
   --boot_disk_size 300
 ```
 
-### 4) Worker pipeline entry
+### 5) Worker pipeline entry
 
 ```bash
 bash scripts/step-train.sh --epochs 1 --total_steps 100

@@ -78,7 +78,7 @@
 
 # Logging / artifacts (local)
 --ckpt_dir ./output/mini-math-teacher-v1-30K/resume/
---ckpt_interval_steps 5000
+--ckpt_interval_steps 2500
 --save_optimizer_state 1
 --log_interval_steps 100
 
@@ -90,6 +90,6 @@
 --enable_metrics 0
 
 # Resume options:
---resume_from ./output/mini-math-teacher-v1-30K/checkpoints_model_30000.pt 
+--resume_from ./output/mini-math-teacher-v1-30K/resume/model_35000.pt
 --resume_schedule continue 
 --resume_additional_steps 0

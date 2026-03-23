@@ -106,7 +106,7 @@ class InferenceEngine:
             idx = torch.cat([idx, next_token], dim=1)
             generated_ids.append(next_token.item())
 
-            full_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            full_text = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
             new_text = full_text[len(prev_text):]
             prev_text = full_text
 
