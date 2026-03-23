@@ -49,8 +49,65 @@ def read_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
 
 
 def find_samples_file(model_dir: Path) -> Path | None:
+    stable = model_dir / "samples.jsonl"
+    if stable.exists():
+        return stable
     matches = sorted(model_dir.rglob("samples*.jsonl"))
     return matches[0] if matches else None
+
+
+def _filter_rank(filter_name: Any) -> int:
+    name = str(filter_name or "").strip().lower()
+    if name == "flexible-extract":
+        return 0
+    if name == "strict-match":
+        return 1
+    return 10
+
+
+def _sample_group_key(row: dict[str, Any]) -> str:
+    for k in ("doc_hash", "prompt_hash", "target_hash"):
+        v = row.get(k)
+        if isinstance(v, str) and v:
+            return f"{k}:{v}"
+    return f"doc_id:{row.get('doc_id')}"
+
+
+def _is_invalid_filtered(row: dict[str, Any]) -> bool:
+    fr = row.get("filtered_resps")
+    if isinstance(fr, list) and fr:
+        return str(fr[0]).strip().lower() == "[invalid]"
+    return False
+
+
+def read_best_sample_rows(path: Path, limit_docs: int) -> list[dict[str, Any]]:
+    """
+    lm-eval samples may contain one row per doc per filter. Keep one row per doc_id,
+    preferring 'flexible-extract' over 'strict-match'.
+    """
+    best_by_doc: dict[str, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            gkey = _sample_group_key(row)
+
+            prev = best_by_doc.get(gkey)
+            if prev is None:
+                best_by_doc[gkey] = row
+            else:
+                prev_rank = (_filter_rank(prev.get("filter")), 1 if _is_invalid_filtered(prev) else 0)
+                row_rank = (_filter_rank(row.get("filter")), 1 if _is_invalid_filtered(row) else 0)
+                if row_rank < prev_rank:
+                    best_by_doc[gkey] = row
+
+    rows = list(best_by_doc.values())
+    rows.sort(key=lambda r: int(r.get("doc_id", 10**9)) if str(r.get("doc_id", "")).isdigit() else 10**9)
+    if limit_docs > 0:
+        rows = rows[:limit_docs]
+    return rows
 
 
 def extract_text_fields(row: dict[str, Any]) -> tuple[str, str, str, str]:
@@ -69,6 +126,8 @@ def extract_text_fields(row: dict[str, Any]) -> tuple[str, str, str, str]:
     extracted_pred = ""
     if isinstance(row.get("filtered_resps"), list) and row["filtered_resps"]:
         extracted_pred = row["filtered_resps"][0]
+    if str(extracted_pred).strip().lower() == "[invalid]":
+        extracted_pred = ""
     if not extracted_pred:
         extracted_pred = raw_pred
 
@@ -162,8 +221,8 @@ def collect_all_evals(
         both_wrong = 0
 
         if t_samples and s_samples:
-            t_rows = read_jsonl(t_samples, limit=per_eval_sample_limit)
-            s_rows = read_jsonl(s_samples, limit=per_eval_sample_limit)
+            t_rows = read_best_sample_rows(t_samples, limit_docs=per_eval_sample_limit)
+            s_rows = read_best_sample_rows(s_samples, limit_docs=per_eval_sample_limit)
             n = min(len(t_rows), len(s_rows))
             for i in range(n):
                 tq, tg, tp, traw = extract_text_fields(t_rows[i])
