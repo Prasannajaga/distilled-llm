@@ -209,47 +209,31 @@ def collect_all_evals(
         summary["_run_dir"] = str(run_dir)
         summary["_comparison_path"] = str(comp)
 
-        teacher_dir = run_dir / "teacher"
-        student_dir = run_dir / "student"
-        t_samples = find_samples_file(teacher_dir)
-        s_samples = find_samples_file(student_dir)
-
         merged: list[dict[str, Any]] = []
         teacher_wins = 0
         student_wins = 0
         both_correct = 0
         both_wrong = 0
 
-        if t_samples and s_samples:
-            t_rows = read_best_sample_rows(t_samples, limit_docs=per_eval_sample_limit)
-            s_rows = read_best_sample_rows(s_samples, limit_docs=per_eval_sample_limit)
-            n = min(len(t_rows), len(s_rows))
-            for i in range(n):
-                tq, tg, tp, traw = extract_text_fields(t_rows[i])
-                sq, sg, sp, sraw = extract_text_fields(s_rows[i])
-                question = tq or sq
-                gold = tg or sg
-
-                t_ok = prediction_matches(tp, gold)
-                s_ok = prediction_matches(sp, gold)
-
-                winner = "none"
-                if t_ok and not s_ok:
-                    winner = "teacher"
-                    teacher_wins += 1
-                elif s_ok and not t_ok:
-                    winner = "student"
-                    student_wins += 1
-                elif t_ok and s_ok:
-                    winner = "both"
-                    both_correct += 1
-                else:
-                    both_wrong += 1
-
+        # Prefer precomputed examples from comparison.json for portability.
+        cmp_obj = summary.get("sample_comparison", {}) if isinstance(summary.get("sample_comparison"), dict) else {}
+        cmp_examples = cmp_obj.get("examples", []) if isinstance(cmp_obj, dict) else []
+        if isinstance(cmp_examples, list) and cmp_examples:
+            for i, row in enumerate(cmp_examples):
+                if per_eval_sample_limit > 0 and i >= per_eval_sample_limit:
+                    break
+                gold = str(row.get("gold", ""))
+                tp = str(row.get("teacher_pred_extracted", row.get("teacher_pred", "")))
+                sp = str(row.get("student_pred_extracted", row.get("student_pred", "")))
+                traw = str(row.get("teacher_pred_raw", tp))
+                sraw = str(row.get("student_pred_raw", sp))
+                t_ok = bool(row.get("teacher_ok", prediction_matches(tp, gold)))
+                s_ok = bool(row.get("student_ok", prediction_matches(sp, gold)))
+                winner = str(row.get("winner", "none"))
                 merged.append(
                     {
-                        "idx": i,
-                        "question": question,
+                        "idx": int(row.get("idx", i)) if str(row.get("idx", "")).isdigit() else i,
+                        "question": str(row.get("question", "")),
                         "gold": gold,
                         "teacher": tp,
                         "student": sp,
@@ -260,6 +244,59 @@ def collect_all_evals(
                         "winner": winner,
                     }
                 )
+                if winner == "teacher":
+                    teacher_wins += 1
+                elif winner == "student":
+                    student_wins += 1
+                elif winner == "both":
+                    both_correct += 1
+                else:
+                    both_wrong += 1
+        else:
+            teacher_dir = run_dir / "teacher"
+            student_dir = run_dir / "student"
+            t_samples = find_samples_file(teacher_dir)
+            s_samples = find_samples_file(student_dir)
+            if t_samples and s_samples:
+                t_rows = read_best_sample_rows(t_samples, limit_docs=per_eval_sample_limit)
+                s_rows = read_best_sample_rows(s_samples, limit_docs=per_eval_sample_limit)
+                n = min(len(t_rows), len(s_rows))
+                for i in range(n):
+                    tq, tg, tp, traw = extract_text_fields(t_rows[i])
+                    sq, sg, sp, sraw = extract_text_fields(s_rows[i])
+                    question = tq or sq
+                    gold = tg or sg
+
+                    t_ok = prediction_matches(tp, gold)
+                    s_ok = prediction_matches(sp, gold)
+
+                    winner = "none"
+                    if t_ok and not s_ok:
+                        winner = "teacher"
+                        teacher_wins += 1
+                    elif s_ok and not t_ok:
+                        winner = "student"
+                        student_wins += 1
+                    elif t_ok and s_ok:
+                        winner = "both"
+                        both_correct += 1
+                    else:
+                        both_wrong += 1
+
+                    merged.append(
+                        {
+                            "idx": i,
+                            "question": question,
+                            "gold": gold,
+                            "teacher": tp,
+                            "student": sp,
+                            "teacher_raw": traw,
+                            "student_raw": sraw,
+                            "teacher_ok": t_ok,
+                            "student_ok": s_ok,
+                            "winner": winner,
+                        }
+                    )
 
         summary["_samples_count"] = len(merged)
         summary["_teacher_wins"] = teacher_wins

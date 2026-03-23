@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-fewshot", type=int, default=8)
     p.add_argument("--gen-max-toks", type=int, default=64)
     p.add_argument(
+        "--sample-comparison-limit",
+        type=int,
+        default=0,
+        help="How many sample comparison rows to store in comparison.json (<=0 means all).",
+    )
+    p.add_argument(
         "--local-models-only",
         action="store_true",
         help="Force local model loading only (no Hugging Face download).",
@@ -252,24 +258,78 @@ def materialize_readable_artifacts(model_out_dir: Path) -> tuple[Path | None, Pa
     return stable_results, stable_samples
 
 
-def _extract_triplet(sample_row: dict[str, Any]) -> tuple[str, str, str]:
+def _filter_rank(filter_name: Any) -> int:
+    name = str(filter_name or "").strip().lower()
+    if name == "flexible-extract":
+        return 0
+    if name == "strict-match":
+        return 1
+    return 10
+
+
+def _sample_group_key(row: dict[str, Any]) -> str:
+    for k in ("doc_hash", "prompt_hash", "target_hash"):
+        v = row.get(k)
+        if isinstance(v, str) and v:
+            return f"{k}:{v}"
+    return f"doc_id:{row.get('doc_id')}"
+
+
+def _is_invalid_filtered(row: dict[str, Any]) -> bool:
+    fr = row.get("filtered_resps")
+    if isinstance(fr, list) and fr:
+        return str(fr[0]).strip().lower() == "[invalid]"
+    return False
+
+
+def read_best_sample_rows(path: Path, limit_docs: int) -> list[dict[str, Any]]:
+    best_by_doc: dict[str, dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            key = _sample_group_key(row)
+            prev = best_by_doc.get(key)
+            if prev is None:
+                best_by_doc[key] = row
+            else:
+                prev_rank = (_filter_rank(prev.get("filter")), 1 if _is_invalid_filtered(prev) else 0)
+                row_rank = (_filter_rank(row.get("filter")), 1 if _is_invalid_filtered(row) else 0)
+                if row_rank < prev_rank:
+                    best_by_doc[key] = row
+
+    rows = list(best_by_doc.values())
+    rows.sort(key=lambda r: int(r.get("doc_id", 10**9)) if str(r.get("doc_id", "")).isdigit() else 10**9)
+    if limit_docs > 0:
+        rows = rows[:limit_docs]
+    return rows
+
+
+def _extract_triplet(sample_row: dict[str, Any]) -> tuple[str, str, str, str]:
     doc = sample_row.get("doc", {}) if isinstance(sample_row.get("doc", {}), dict) else {}
     question = str(doc.get("question", sample_row.get("prompt", "")))
     gold = str(sample_row.get("target", doc.get("answer", "")))
 
-    pred = ""
+    raw_pred = ""
     resps = sample_row.get("resps")
     if isinstance(resps, list) and resps:
         first = resps[0]
         if isinstance(first, list) and first:
-            pred = str(first[0])
+            raw_pred = str(first[0])
         else:
-            pred = str(first)
-    if not pred:
-        fresps = sample_row.get("filtered_resps")
-        if isinstance(fresps, list) and fresps:
-            pred = str(fresps[0])
-    return question, gold, pred
+            raw_pred = str(first)
+
+    extracted_pred = ""
+    fresps = sample_row.get("filtered_resps")
+    if isinstance(fresps, list) and fresps:
+        extracted_pred = str(fresps[0])
+    if extracted_pred.strip().lower() == "[invalid]":
+        extracted_pred = ""
+    if not extracted_pred:
+        extracted_pred = raw_pred
+    return question, gold, extracted_pred, raw_pred
 
 
 def _norm_text(x: str) -> str:
@@ -316,8 +376,8 @@ def build_sample_comparison(
             "examples": [],
         }
 
-    t_rows = read_sample_rows(teacher_samples, limit=limit)
-    s_rows = read_sample_rows(student_samples, limit=limit)
+    t_rows = read_best_sample_rows(teacher_samples, limit_docs=limit)
+    s_rows = read_best_sample_rows(student_samples, limit_docs=limit)
     n = min(len(t_rows), len(s_rows))
 
     teacher_wins = 0
@@ -327,8 +387,8 @@ def build_sample_comparison(
     examples: list[dict[str, Any]] = []
 
     for i in range(n):
-        tq, tg, tp = _extract_triplet(t_rows[i])
-        sq, sg, sp = _extract_triplet(s_rows[i])
+        tq, tg, tp, tp_raw = _extract_triplet(t_rows[i])
+        sq, sg, sp, sp_raw = _extract_triplet(s_rows[i])
         question = tq or sq
         gold = tg or sg
 
@@ -355,6 +415,10 @@ def build_sample_comparison(
                 "gold": gold,
                 "teacher_pred": tp,
                 "student_pred": sp,
+                "teacher_pred_extracted": tp,
+                "student_pred_extracted": sp,
+                "teacher_pred_raw": tp_raw,
+                "student_pred_raw": sp_raw,
                 "teacher_ok": t_ok,
                 "student_ok": s_ok,
                 "winner": winner,
@@ -581,7 +645,11 @@ def main() -> None:
 
     teacher_samples = teacher_samples_stable if teacher_samples_stable else find_latest_samples_jsonl(teacher_out)
     student_samples = student_samples_stable if student_samples_stable else find_latest_samples_jsonl(student_out)
-    sample_cmp = build_sample_comparison(teacher_samples, student_samples, limit=80)
+    sample_cmp = build_sample_comparison(
+        teacher_samples,
+        student_samples,
+        limit=int(args.sample_comparison_limit),
+    )
 
     summary = {
         "created_at_utc": utc_now(),
