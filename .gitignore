@@ -26,3 +26,8 @@ output/mini-math-teacher-v1-30K/checkpoints_model_30000.safetensors
 output/mini-math-teacher-v1-30K/model.safetensors
 projects.txt
 scripts/eval_compare_models.py
+unsloth_compiled_cache/
+*.safetensors
+*.pth
+output/teacher-gsm8k-unsloth-lora/
+output/teacher-gsm8k-unsloth-merged/

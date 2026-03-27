@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>LM Eval Runs - before-distill-v3</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    .table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .samples-wrap {
+      max-height: 70vh;
+    }
+    .samples-table {
+      min-width: 1200px;
+      table-layout: fixed;
+    }
+    .samples-table th,
+    .samples-table td {
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }
+    .samples-table thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #f8fafc;
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-b from-slate-100 to-slate-50 text-slate-900">
+  <main class="max-w-7xl mx-auto px-4 py-8 space-y-8">
+    <section class="rounded-3xl bg-white/95 border border-slate-200 shadow-sm p-6">
+      <div class="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <h1 class="text-2xl md:text-3xl font-bold tracking-tight">LM Eval Runs</h1>
+          <p class="text-slate-600 mt-1">Current eval: <span class="font-medium">before-distill-v3</span></p>
+          <p class="text-xs text-slate-500 mt-1">Task: gsm8k_local_before_distill_v3 | Rows: 1319 | Created: 2026-03-24 06:37:42</p>
+        </div>
+      </div>
+
+      <div class="grid sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-5">
+        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4"><div class="text-xs text-slate-500">Teacher EM (current)</div><div class="text-2xl font-semibold mt-1">0.160728</div></div>
+        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4"><div class="text-xs text-slate-500">Student EM (current)</div><div class="text-2xl font-semibold mt-1">0.050038</div></div>
+        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4"><div class="text-xs text-slate-500">Delta (T-S)</div><div class="text-2xl font-semibold mt-1">0.110690</div></div>
+        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4"><div class="text-xs text-slate-500">All evals</div><div class="text-2xl font-semibold mt-1">3</div><div class="text-xs text-slate-500 mt-1">scored: 3</div></div>
+      </div>
+
+      <div class="grid sm:grid-cols-2 gap-4 mt-4">
+        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4"><div class="text-xs text-slate-500">Best Teacher EM</div><div class="text-sm font-medium mt-1 break-all">0.160728 (before-distill-v3)</div></div>
+        <div class="rounded-xl border border-slate-200 bg-slate-50 p-4"><div class="text-xs text-slate-500">Best Student EM</div><div class="text-sm font-medium mt-1 break-all">0.050038 (before-distill-v3)</div></div>
+      </div>
+
+      <div class="mt-4 text-xs text-slate-500 break-all">Teacher model: Qwen/Qwen2-Math-1.5B-Instruct</div>
+      <div class="mt-1 text-xs text-slate-500 break-all">Student model: Qwen/Qwen2-0.5B-Instruct</div>
+    </section>
+
+    <section class="rounded-3xl bg-white/95 border border-slate-200 shadow-sm p-6">
+      <div class="flex items-center justify-between gap-3">
+        <div>
+          <h2 class="text-xl font-semibold">Leaderboard (All Evals)</h2>
+          <p class="text-sm text-slate-600 mt-1">Sorted by Teacher EM descending</p>
+        </div>
+      </div>
+      <div class="table-wrap mt-4">
+        <table class="w-full text-sm">
+          <thead>
+            <tr class="border-b border-slate-200 bg-slate-50">
+              <th class="py-2.5 px-3 text-right">Rank</th>
+              <th class="py-2.5 px-3 text-left">Eval</th>
+              <th class="py-2.5 px-3 text-left">Created</th>
+              <th class="py-2.5 px-3 text-right">Rows</th>
+              <th class="py-2.5 px-3 text-right">Teacher EM</th>
+              <th class="py-2.5 px-3 text-right">Student EM</th>
+              <th class="py-2.5 px-3 text-right">Delta</th>
+            </tr>
+          </thead>
+          <tbody><tr class='border-b border-slate-200 bg-indigo-50'><td class='py-2.5 px-3 text-right font-medium'>1</td><td class='py-2.5 px-3 font-medium'>before-distill-v3 <span class='text-xs text-indigo-700'>(current)</span></td><td class='py-2.5 px-3'>2026-03-24 06:37:42</td><td class='py-2.5 px-3 text-right'>1319</td><td class='py-2.5 px-3 text-right'>0.160728</td><td class='py-2.5 px-3 text-right'>0.050038</td><td class='py-2.5 px-3 text-right'>0.110690</td></tr><tr class='border-b border-slate-200 '><td class='py-2.5 px-3 text-right font-medium'>2</td><td class='py-2.5 px-3 font-medium'>before-distill-v2</td><td class='py-2.5 px-3'>2026-03-24 06:10:19</td><td class='py-2.5 px-3 text-right'>1319</td><td class='py-2.5 px-3 text-right'>0.160728</td><td class='py-2.5 px-3 text-right'>0.050038</td><td class='py-2.5 px-3 text-right'>0.110690</td></tr><tr class='border-b border-slate-200 '><td class='py-2.5 px-3 text-right font-medium'>3</td><td class='py-2.5 px-3 font-medium'>before-distill-v1</td><td class='py-2.5 px-3'>2026-03-23 17:24:21</td><td class='py-2.5 px-3 text-right'>1319</td><td class='py-2.5 px-3 text-right'>0.160728</td><td class='py-2.5 px-3 text-right'>0.050038</td><td class='py-2.5 px-3 text-right'>0.110690</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="rounded-3xl bg-white/95 border border-slate-200 shadow-sm p-6">
+      <h2 class="text-xl font-semibold">All Eval Comparisons</h2>
+      <p class="text-sm text-slate-600 mt-1">Click any card to switch sample explorer to that eval.</p>
+      <div class="grid md:grid-cols-2 xl:grid-cols-3 gap-4 mt-4">
+        <button type='button' data-eval='before-distill-v3' class='eval-card text-left rounded-2xl border border-slate-200 bg-white p-4 shadow-sm hover:shadow transition ring-2 ring-indigo-300'><div class='text-xs text-slate-500'>2026-03-24 06:37:42</div><div class='text-base font-semibold text-slate-900 mt-1 truncate'>before-distill-v3</div><div class='mt-2 text-sm text-slate-700'>Rows: <b>1319</b> | Samples: <b>1319</b></div><div class='mt-1 text-sm text-slate-700'>Teacher EM: <b>0.160728</b></div><div class='mt-1 text-sm text-slate-700'>Student EM: <b>0.050038</b></div><div class='mt-1 text-sm text-slate-700'>Delta: <b>0.110690</b></div><div class='mt-2 text-xs text-slate-500'>H2H (loaded samples): T 177 / S 31 / Both 35</div></button><button type='button' data-eval='before-distill-v2' class='eval-card text-left rounded-2xl border border-slate-200 bg-white p-4 shadow-sm hover:shadow transition '><div class='text-xs text-slate-500'>2026-03-24 06:10:19</div><div class='text-base font-semibold text-slate-900 mt-1 truncate'>before-distill-v2</div><div class='mt-2 text-sm text-slate-700'>Rows: <b>1319</b> | Samples: <b>1319</b></div><div class='mt-1 text-sm text-slate-700'>Teacher EM: <b>0.160728</b></div><div class='mt-1 text-sm text-slate-700'>Student EM: <b>0.050038</b></div><div class='mt-1 text-sm text-slate-700'>Delta: <b>0.110690</b></div><div class='mt-2 text-xs text-slate-500'>H2H (loaded samples): T 177 / S 31 / Both 35</div></button><button type='button' data-eval='before-distill-v1' class='eval-card text-left rounded-2xl border border-slate-200 bg-white p-4 shadow-sm hover:shadow transition '><div class='text-xs text-slate-500'>2026-03-23 17:24:21</div><div class='text-base font-semibold text-slate-900 mt-1 truncate'>before-distill-v1</div><div class='mt-2 text-sm text-slate-700'>Rows: <b>1319</b> | Samples: <b>1319</b></div><div class='mt-1 text-sm text-slate-700'>Teacher EM: <b>0.160728</b></div><div class='mt-1 text-sm text-slate-700'>Student EM: <b>0.050038</b></div><div class='mt-1 text-sm text-slate-700'>Delta: <b>0.110690</b></div><div class='mt-2 text-xs text-slate-500'>H2H (loaded samples): T 177 / S 31 / Both 35</div></button>
+      </div>
+    </section>
+
+    <section class="rounded-3xl bg-white/95 border border-slate-200 shadow-sm p-6">
+      <div class="flex flex-wrap gap-3 items-end">
+        <div>
+          <label class="block text-xs text-slate-500 mb-1">Eval</label>
+          <select id="evalSelect" class="border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white"><option value='before-distill-v3' selected>before-distill-v3</option><option value='before-distill-v2' >before-distill-v2</option><option value='before-distill-v1' >before-distill-v1</option></select>
+        </div>
+        <div class="flex-1 min-w-[220px]">
+          <label class="block text-xs text-slate-500 mb-1">Search question/prediction</label>
+          <input id="searchInput" class="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm" placeholder="Type to filter..." />
+        </div>
+        <label class="inline-flex items-center gap-2 text-sm text-slate-700"><input id="diffOnly" type="checkbox" class="rounded" /> Show only disagreements</label>
+        <label class="inline-flex items-center gap-2 text-sm text-slate-700"><input id="matchOnly" type="checkbox" class="rounded" /> Show only exact matches</label>
+      </div>
+
+      <div class="table-wrap samples-wrap mt-4 border border-slate-200 rounded-xl">
+        <table class="samples-table w-full text-sm">
+          <thead>
+            <tr class="border-b border-slate-200 bg-slate-50">
+              <th class="py-2.5 px-3 text-left">#</th>
+              <th class="py-2.5 px-3 text-left">Winner</th>
+              <th class="py-2.5 px-3 text-left">Question</th>
+              <th class="py-2.5 px-3 text-left">Gold</th>
+              <th class="py-2.5 px-3 text-left">Teacher ✓</th>
+              <th class="py-2.5 px-3 text-left">Teacher Extracted</th>
+              <th class="py-2.5 px-3 text-left">Teacher Raw</th>
+              <th class="py-2.5 px-3 text-left">Student ✓</th>
+              <th class="py-2.5 px-3 text-left">Student Extracted</th>
+              <th class="py-2.5 px-3 text-left">Student Raw</th>
+            </tr>
+          </thead>
+          <tbody id="samplesBody"></tbody>
+        </table>
+      </div>
+      <p id="samplesInfo" class="mt-3 text-xs text-slate-500"></p>
+    </section>
+  </main>
+
+  <script>
+    const rowLimit = 120;
+    let samplesByEval = {};
+
+    async function loadSamplesByEval() {
+      try {
+        const res = await fetch('./samples-by-eval.json');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        samplesByEval = await res.json();
+        renderSamples();
+      } catch (err) {
+        console.error('Failed to load samples JSON:', err);
+        samplesBody.innerHTML = '<tr><td class="py-3 px-3 text-rose-600" colspan="10">Failed to load samples JSON file.</td></tr>';
+        samplesInfo.textContent = 'Could not load ./samples-by-eval.json';
+      }
+    }
+
+    const evalSelect = document.getElementById('evalSelect');
+    const searchInput = document.getElementById('searchInput');
+    const diffOnly = document.getElementById('diffOnly');
+    const matchOnly = document.getElementById('matchOnly');
+    const samplesBody = document.getElementById('samplesBody');
+    const samplesInfo = document.getElementById('samplesInfo');
+
+    function esc(s) {
+      return String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;');
+    }
+
+    function winnerBadge(w) {
+      if (w === 'teacher') return '<span class="inline-flex rounded-full bg-emerald-100 text-emerald-800 px-2 py-0.5 text-xs font-medium">Teacher</span>';
+      if (w === 'student') return '<span class="inline-flex rounded-full bg-sky-100 text-sky-800 px-2 py-0.5 text-xs font-medium">Student</span>';
+      if (w === 'both') return '<span class="inline-flex rounded-full bg-violet-100 text-violet-800 px-2 py-0.5 text-xs font-medium">Both</span>';
+      return '<span class="inline-flex rounded-full bg-slate-100 text-slate-700 px-2 py-0.5 text-xs font-medium">None</span>';
+    }
+
+    function matchBadge(ok) {
+      return ok
+        ? '<span class="inline-flex rounded-full bg-emerald-100 text-emerald-800 px-2 py-0.5 text-xs font-semibold">✅</span>'
+        : '<span class="inline-flex rounded-full bg-rose-100 text-rose-800 px-2 py-0.5 text-xs font-semibold">❌</span>';
+    }
+
+    function renderSamples() {
+      const evalName = evalSelect.value;
+      const q = searchInput.value.trim().toLowerCase();
+      const allRows = samplesByEval[evalName] || [];
+      const filtered = allRows.filter(r => {
+        if (diffOnly.checked && String(r.teacher).trim() === String(r.student).trim()) return false;
+        if (matchOnly.checked && !(r.teacher_ok || r.student_ok)) return false;
+        if (!q) return true;
+        const blob = `${r.question} ${r.gold} ${r.teacher} ${r.student} ${r.teacher_raw || ''} ${r.student_raw || ''} ${r.winner}`.toLowerCase();
+        return blob.includes(q);
+      });
+
+      const rows = filtered.slice(0, rowLimit);
+      if (!rows.length) {
+        samplesBody.innerHTML = '<tr><td class="py-3 px-3 text-slate-500" colspan="10">No samples found for this filter.</td></tr>';
+        samplesInfo.textContent = `Eval: ${evalName} | 0 / ${allRows.length} rows shown`;
+        return;
+      }
+
+      samplesBody.innerHTML = rows.map(r => `
+        <tr class="border-b border-slate-200 align-top">
+          <td class="py-2.5 px-3 text-slate-500">${esc(r.idx)}</td>
+          <td class="py-2.5 px-3">${winnerBadge(r.winner)}</td>
+          <td class="py-2.5 px-3">${esc(r.question)}</td>
+          <td class="py-2.5 px-3">${esc(r.gold)}</td>
+          <td class="py-2.5 px-3">${matchBadge(!!r.teacher_ok)}</td>
+          <td class="py-2.5 px-3">${esc(r.teacher)}</td>
+          <td class="py-2.5 px-3">${esc(r.teacher_raw || '')}</td>
+          <td class="py-2.5 px-3">${matchBadge(!!r.student_ok)}</td>
+          <td class="py-2.5 px-3">${esc(r.student)}</td>
+          <td class="py-2.5 px-3">${esc(r.student_raw || '')}</td>
+        </tr>
+      `).join('');
+      samplesInfo.textContent = `Eval: ${evalName} | ${rows.length} / ${allRows.length} rows shown`;
+    }
+
+    evalSelect.addEventListener('change', renderSamples);
+    searchInput.addEventListener('input', renderSamples);
+    diffOnly.addEventListener('change', renderSamples);
+    matchOnly.addEventListener('change', renderSamples);
+
+    document.querySelectorAll('.eval-card').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const evalName = btn.getAttribute('data-eval');
+        if (!evalName) return;
+        evalSelect.value = evalName;
+        renderSamples();
+        window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+      });
+    });
+    loadSamplesByEval();
+  </script>
+</body>
+</html>
