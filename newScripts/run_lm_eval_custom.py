@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import shutil
@@ -10,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from datasets import Dataset
+from datasets import Dataset, load_dataset
 
 DEFAULT_STUDENT_MODEL = "Qwen/Qwen2-0.5B-Instruct"
 DEFAULT_TEACHER_MODEL = "Qwen/Qwen2-Math-1.5B-Instruct"
@@ -53,9 +54,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--overwrite-output",
         action="store_true",
-        help="Overwrite existing output dir (keeps stable naming; no auto timestamp suffix).",
+        help="Clear existing output dir before running (keeps stable naming; no auto timestamp suffix).",
     )
     p.add_argument("--output-dir", type=str, default=None)
+    p.add_argument("--render-html", type=int, choices=[0, 1], default=1, help="Render report.html at end of run")
+    p.add_argument(
+        "--html-limit",
+        type=int,
+        default=0,
+        help="Max sample rows shown in report.html (<=0 means all).",
+    )
+    p.add_argument(
+        "--html-per-eval-sample-limit",
+        type=int,
+        default=0,
+        help="Max loaded rows per eval for all-evals sample explorer in report.html (<=0 means all).",
+    )
+    p.add_argument("--html-title", type=str, default="lm-eval Dashboard", help="HTML report title")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -150,6 +165,23 @@ def to_jsonl_from_arrow(split_arrow: Path, out_jsonl: Path, max_samples: int) ->
     return count
 
 
+def to_jsonl_from_hf(split: str, out_jsonl: Path, max_samples: int) -> int:
+    ds = load_dataset("openai/gsm8k", "main", split=split)
+    count = 0
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with out_jsonl.open("w", encoding="utf-8") as f:
+        for row in ds:
+            q = str(row.get("question", "")).strip()
+            a = str(row.get("answer", "")).strip()
+            if not q or not a:
+                continue
+            f.write(json.dumps({"question": q, "answer": a}, ensure_ascii=False) + "\n")
+            count += 1
+            if max_samples > 0 and count >= max_samples:
+                break
+    return count
+
+
 def write_task_yaml(task_path: Path, data_jsonl: Path, num_fewshot: int, task_name: str) -> str:
     yaml = f"""task: {task_name}
 dataset_path: json
@@ -207,13 +239,19 @@ def run_cmd(cmd: list[str], cwd: Path) -> None:
     subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
-def find_latest_results_json(output_root: Path) -> Path | None:
-    candidates = sorted(
-        output_root.rglob("results*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+def ensure_lm_eval_installed() -> None:
+    probe = subprocess.run(
+        ["uv", "run", "python", "-c", "import lm_eval"],
+        capture_output=True,
+        text=True,
     )
-    return candidates[0] if candidates else None
+    if probe.returncode != 0:
+        raise RuntimeError(
+            "Missing dependency: lm_eval is not installed in this uv environment.\n"
+            "Run one of:\n"
+            "  uv sync\n"
+            "  uv pip install lm-eval\n"
+        )
 
 
 def read_sample_rows(samples_jsonl: Path, limit: int | None = None) -> list[dict[str, Any]]:
@@ -229,33 +267,61 @@ def read_sample_rows(samples_jsonl: Path, limit: int | None = None) -> list[dict
     return rows
 
 
-def find_latest_samples_jsonl(output_root: Path) -> Path | None:
+def _latest_matching(output_root: Path, pattern: str) -> Path | None:
     candidates = sorted(
-        output_root.rglob("samples*.jsonl"),
+        output_root.rglob(pattern),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     return candidates[0] if candidates else None
 
 
-def materialize_readable_artifacts(model_out_dir: Path) -> tuple[Path | None, Path | None]:
-    """
-    Copies latest lm-eval raw outputs to stable readable paths:
-      - <model_out_dir>/results.json
-      - <model_out_dir>/samples.jsonl
-    """
-    latest_results = find_latest_results_json(model_out_dir)
-    latest_samples = find_latest_samples_jsonl(model_out_dir)
+def _remove_empty_parents(path: Path, stop_at: Path) -> None:
+    cur = path.parent
+    while cur != stop_at and stop_at in cur.parents:
+        try:
+            cur.rmdir()
+        except OSError:
+            break
+        cur = cur.parent
 
-    stable_results: Path | None = None
-    stable_samples: Path | None = None
-    if latest_results is not None and latest_results.exists():
-        stable_results = model_out_dir / "results.json"
-        shutil.copy2(latest_results, stable_results)
-    if latest_samples is not None and latest_samples.exists():
-        stable_samples = model_out_dir / "samples.jsonl"
-        shutil.copy2(latest_samples, stable_samples)
-    return stable_results, stable_samples
+
+def normalize_model_artifacts(model_out_dir: Path) -> tuple[Path | None, Path | None]:
+    """
+    Ensure only stable artifact names are used in model_out_dir:
+      - results.json
+      - samples.jsonl
+    If timestamped/nested artifacts exist, move newest ones into stable paths.
+    """
+    stable_results = model_out_dir / "results.json"
+    stable_samples = model_out_dir / "samples.jsonl"
+
+    latest_results = _latest_matching(model_out_dir, "results*.json")
+    latest_samples = _latest_matching(model_out_dir, "samples*.jsonl")
+
+    if latest_results and latest_results.exists() and latest_results != stable_results:
+        stable_results.parent.mkdir(parents=True, exist_ok=True)
+        latest_results.replace(stable_results)
+        _remove_empty_parents(latest_results, model_out_dir)
+    if latest_samples and latest_samples.exists() and latest_samples != stable_samples:
+        stable_samples.parent.mkdir(parents=True, exist_ok=True)
+        latest_samples.replace(stable_samples)
+        _remove_empty_parents(latest_samples, model_out_dir)
+
+    # Cleanup any leftover timestamped duplicates.
+    for p in list(model_out_dir.rglob("results*.json")):
+        if p != stable_results and p.exists():
+            p.unlink()
+            _remove_empty_parents(p, model_out_dir)
+    for p in list(model_out_dir.rglob("samples*.jsonl")):
+        if p != stable_samples and p.exists():
+            p.unlink()
+            _remove_empty_parents(p, model_out_dir)
+
+    return (
+        stable_results if stable_results.exists() else None,
+        stable_samples if stable_samples.exists() else None,
+    )
 
 
 def _filter_rank(filter_name: Any) -> int:
@@ -327,8 +393,6 @@ def _extract_triplet(sample_row: dict[str, Any]) -> tuple[str, str, str, str]:
         extracted_pred = str(fresps[0])
     if extracted_pred.strip().lower() == "[invalid]":
         extracted_pred = ""
-    if not extracted_pred:
-        extracted_pred = raw_pred
     return question, gold, extracted_pred, raw_pred
 
 
@@ -373,6 +437,8 @@ def build_sample_comparison(
             "student_wins": 0,
             "both_correct": 0,
             "both_wrong": 0,
+            "teacher_accuracy": None,
+            "student_accuracy": None,
             "examples": [],
         }
 
@@ -387,13 +453,17 @@ def build_sample_comparison(
     examples: list[dict[str, Any]] = []
 
     for i in range(n):
-        tq, tg, tp, tp_raw = _extract_triplet(t_rows[i])
-        sq, sg, sp, sp_raw = _extract_triplet(s_rows[i])
+        tq, tg, tp_extracted, tp_raw = _extract_triplet(t_rows[i])
+        sq, sg, sp_extracted, sp_raw = _extract_triplet(s_rows[i])
         question = tq or sq
         gold = tg or sg
 
-        t_ok = _matches(tp, gold)
-        s_ok = _matches(sp, gold)
+        # Use extracted predictions for comparison; fall back to raw only if extraction failed.
+        tp_for_match = tp_extracted if tp_extracted else tp_raw
+        sp_for_match = sp_extracted if sp_extracted else sp_raw
+
+        t_ok = _matches(tp_for_match, gold)
+        s_ok = _matches(sp_for_match, gold)
 
         winner = "none"
         if t_ok and not s_ok:
@@ -413,12 +483,10 @@ def build_sample_comparison(
                 "idx": i,
                 "question": question,
                 "gold": gold,
-                "teacher_pred": tp,
-                "student_pred": sp,
-                "teacher_pred_extracted": tp,
-                "student_pred_extracted": sp,
-                "teacher_pred_raw": tp_raw,
-                "student_pred_raw": sp_raw,
+                "teacher_pred": tp_extracted,
+                "student_pred": sp_extracted,
+                "teacher_raw": tp_raw,
+                "student_raw": sp_raw,
                 "teacher_ok": t_ok,
                 "student_ok": s_ok,
                 "winner": winner,
@@ -433,8 +501,33 @@ def build_sample_comparison(
         "student_wins": student_wins,
         "both_correct": both_correct,
         "both_wrong": both_wrong,
+        "teacher_accuracy": ((teacher_wins + both_correct) / n) if n > 0 else None,
+        "student_accuracy": ((student_wins + both_correct) / n) if n > 0 else None,
         "examples": examples,
     }
+
+
+def write_sample_columns_jsonl(path: Path, sample_cmp: dict[str, Any]) -> None:
+    """
+    Write a flattened, analysis-friendly samples table with stable columns.
+    """
+    rows = sample_cmp.get("examples", [])
+    if not isinstance(rows, list):
+        rows = []
+    with path.open("w", encoding="utf-8") as f:
+        for r in rows:
+            row = {
+                "question": str(r.get("question", "")),
+                "gold_answer": str(r.get("gold", "")),
+                "teacher_extracted": str(r.get("teacher_pred", "")),
+                "teacher_raw_prediction": str(r.get("teacher_raw", "")),
+                "student": str(r.get("student_pred", "")),
+                "student_extracted": str(r.get("student_pred", "")),
+                "student_raw_prediction": str(r.get("student_raw", "")),
+                "teacher_accuracy": 1 if bool(r.get("teacher_ok", False)) else 0,
+                "student_accuracy": 1 if bool(r.get("student_ok", False)) else 0,
+            }
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def extract_score(result_json: Path, task_name: str) -> tuple[float | None, str | None]:
@@ -512,6 +605,22 @@ def resolve_model_ref(model_ref: str, local_only: bool) -> tuple[str, bool]:
       - model_ref_for_lm_eval (absolute local path if directory exists, otherwise original string)
       - is_local_path
     """
+    def infer_hf_repo_id(ref: str) -> str | None:
+        # Common local cache folder name:
+        #   models--ORG--NAME  -> ORG/NAME
+        # Also supports full paths containing that segment.
+        for part in Path(ref).expanduser().parts:
+            if part.startswith("models--") and part.count("--") >= 2:
+                body = part[len("models--") :]
+                repo = body.replace("--", "/", 1)
+                return repo if "/" in repo else None
+        name = Path(ref).name
+        if name.startswith("models--") and name.count("--") >= 2:
+            body = name[len("models--") :]
+            repo = body.replace("--", "/", 1)
+            return repo if "/" in repo else None
+        return None
+
     p = Path(model_ref).expanduser()
     if p.exists():
         p = p.resolve()
@@ -548,32 +657,91 @@ def resolve_model_ref(model_ref: str, local_only: bool) -> tuple[str, bool]:
                 )
 
         return str(p), True
+    inferred_repo = infer_hf_repo_id(model_ref)
+    if inferred_repo:
+        print(
+            f"[INFO] Local model path not found: {model_ref}. "
+            f"Falling back to Hugging Face repo: {inferred_repo}"
+        )
+        return inferred_repo, False
     if local_only:
-        raise FileNotFoundError(
-            f"--local-models-only was set, but model path does not exist locally: {model_ref}"
+        print(
+            f"[WARN] --local-models-only was set, but local model path was not found: {model_ref}. "
+            "Falling back to remote model resolution."
         )
     return model_ref, False
 
 
+def render_html_report(
+    *,
+    run_dir: Path,
+    root_dir: Path,
+    title: str,
+    row_limit: int,
+    per_eval_sample_limit: int,
+) -> Path:
+    renderer_path = Path(__file__).with_name("render_lm_eval_html.py")
+    spec = importlib.util.spec_from_file_location("render_lm_eval_html", renderer_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load html renderer module: {renderer_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    comp = run_dir / "comparison.json"
+    current = module.load_json(comp)
+    evals, samples_by_eval = module.collect_all_evals(
+        root_dir,
+        per_eval_sample_limit=max(0, int(per_eval_sample_limit)),
+    )
+    effective_row_limit = int(row_limit)
+    if effective_row_limit <= 0:
+        # Render all rows by using a very high cap for the client-side table slice.
+        effective_row_limit = 10**9
+
+    html_text = module.render_html(
+        run_dir=run_dir,
+        current=current,
+        evals=evals,
+        samples_by_eval=samples_by_eval,
+        title=title,
+        row_limit=effective_row_limit,
+    )
+    out = run_dir / "report.html"
+    out.write_text(html_text, encoding="utf-8")
+    return out
+
+
 def main() -> None:
     args = parse_args()
+    ensure_lm_eval_installed()
     base_root = Path("newoutput") / "lm_eval"
     eval_name_raw = args.eval_name or "custom_gsm8k"
     eval_name = slugify(eval_name_raw)
     out_dir = Path(args.output_dir) if args.output_dir else (base_root / eval_name)
     eval_name_final = out_dir.name
-    if out_dir.exists() and any(out_dir.iterdir()) and not args.overwrite_output:
-        raise FileExistsError(
-            f"Output directory already exists and is not empty: {out_dir}\n"
-            "Use --overwrite-output to reuse stable directory naming."
-        )
+    if out_dir.exists() and any(out_dir.iterdir()) and args.overwrite_output:
+        for child in out_dir.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    split_arrow = resolve_split_arrow(args.dataset_path, args.split)
     task_slug = taskify(eval_name_final)
     task_name = f"gsm8k_local_{task_slug}"
     data_jsonl = out_dir / f"{task_name}_{args.split}.jsonl"
-    n_rows = to_jsonl_from_arrow(split_arrow, data_jsonl, args.max_samples)
+    dataset_arrow_str: str
+    try:
+        split_arrow = resolve_split_arrow(args.dataset_path, args.split)
+        n_rows = to_jsonl_from_arrow(split_arrow, data_jsonl, args.max_samples)
+        dataset_arrow_str = str(split_arrow)
+    except FileNotFoundError:
+        print(
+            f"[INFO] Dataset path not found/unusable: {args.dataset_path}. "
+            "Falling back to Hugging Face dataset openai/gsm8k (main)."
+        )
+        n_rows = to_jsonl_from_hf(args.split, data_jsonl, args.max_samples)
+        dataset_arrow_str = "hf://openai/gsm8k/main"
 
     task_yaml = out_dir / f"{task_name}.yaml"
     task_name = write_task_yaml(task_yaml, data_jsonl, args.num_fewshot, task_name)
@@ -610,8 +778,9 @@ def main() -> None:
 
     teacher_model_args = [f"pretrained={teacher_ref}", "trust_remote_code=True", "dtype=auto"]
     student_model_args = [f"pretrained={student_ref}", "trust_remote_code=True", "dtype=auto"]
-    if args.local_models_only:
+    if args.local_models_only and teacher_is_local:
         teacher_model_args.append("local_files_only=True")
+    if args.local_models_only and student_is_local:
         student_model_args.append("local_files_only=True")
 
     teacher_cmd = common + [
@@ -635,27 +804,25 @@ def main() -> None:
     run_cmd(teacher_cmd, Path.cwd())
     run_cmd(student_cmd, Path.cwd())
 
-    teacher_res_stable, teacher_samples_stable = materialize_readable_artifacts(teacher_out)
-    student_res_stable, student_samples_stable = materialize_readable_artifacts(student_out)
+    teacher_res, teacher_samples = normalize_model_artifacts(teacher_out)
+    student_res, student_samples = normalize_model_artifacts(student_out)
 
-    teacher_res = teacher_res_stable if teacher_res_stable else find_latest_results_json(teacher_out)
-    student_res = student_res_stable if student_res_stable else find_latest_results_json(student_out)
     t_score, t_metric_key = extract_score(teacher_res, task_name) if teacher_res else (None, None)
     s_score, s_metric_key = extract_score(student_res, task_name) if student_res else (None, None)
 
-    teacher_samples = teacher_samples_stable if teacher_samples_stable else find_latest_samples_jsonl(teacher_out)
-    student_samples = student_samples_stable if student_samples_stable else find_latest_samples_jsonl(student_out)
     sample_cmp = build_sample_comparison(
         teacher_samples,
         student_samples,
         limit=int(args.sample_comparison_limit),
     )
+    sample_columns_jsonl = out_dir / "sample_columns.jsonl"
+    write_sample_columns_jsonl(sample_columns_jsonl, sample_cmp)
 
     summary = {
         "created_at_utc": utc_now(),
         "eval_name": eval_name_final,
         "task_name": task_name,
-        "dataset_arrow": str(split_arrow),
+        "dataset_arrow": dataset_arrow_str,
         "dataset_jsonl": str(data_jsonl),
         "num_rows": n_rows,
         "teacher_model": teacher_ref,
@@ -675,6 +842,7 @@ def main() -> None:
         "teacher_output": str(teacher_out),
         "student_output": str(student_out),
         "sample_comparison": sample_cmp,
+        "sample_columns_jsonl": str(sample_columns_jsonl),
     }
     (out_dir / "comparison.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     update_leaderboard(base_root, summary)
@@ -684,7 +852,7 @@ def main() -> None:
         "",
         f"- Generated (UTC): `{summary['created_at_utc']}`",
         f"- Task: `{task_name}`",
-        f"- Dataset arrow: `{split_arrow}`",
+        f"- Dataset arrow: `{dataset_arrow_str}`",
         f"- Dataset jsonl: `{data_jsonl}`",
         f"- Rows: `{n_rows}`",
         "",
@@ -701,6 +869,8 @@ def main() -> None:
         f"- Student wins: `{sample_cmp['student_wins']}`",
         f"- Both correct: `{sample_cmp['both_correct']}`",
         f"- Both wrong: `{sample_cmp['both_wrong']}`",
+        f"- Teacher accuracy (loaded rows): `{sample_cmp['teacher_accuracy']}`",
+        f"- Student accuracy (loaded rows): `{sample_cmp['student_accuracy']}`",
         "",
         "## Outputs",
         "",
@@ -709,12 +879,25 @@ def main() -> None:
         f"- Teacher samples: `{teacher_samples}`",
         f"- Student samples: `{student_samples}`",
         f"- Comparison: `{out_dir / 'comparison.json'}`",
+        f"- Sample columns: `{sample_columns_jsonl}`",
     ]
     (out_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
+
+    html_out: Path | None = None
+    if int(args.render_html) == 1:
+        html_out = render_html_report(
+            run_dir=out_dir,
+            root_dir=base_root,
+            title=args.html_title,
+            row_limit=args.html_limit,
+            per_eval_sample_limit=args.html_per_eval_sample_limit,
+        )
 
     print(f"[DONE] out_dir={out_dir}")
     print(f"[DONE] comparison={out_dir / 'comparison.json'}")
     print(f"[DONE] report={out_dir / 'report.md'}")
+    if html_out is not None:
+        print(f"[DONE] html={html_out}")
     print(f"[DONE] leaderboard={base_root / 'leaderboard.md'}")
 
 
