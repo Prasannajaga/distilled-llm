@@ -2,19 +2,33 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import re
+import sys
 from pathlib import Path
 
 from datasets import Dataset, load_dataset
 
-DEFAULT_BASE_MODEL = "Qwen/Qwen2-Math-1.5B-Instruct"
+DEFAULT_BASE_MODEL = "/media/prasanna/716F26140AED9B67/models/models--Qwen--Qwen2-Math-1.5B-Instruct"
 DEFAULT_DATASET_PATH = "/media/prasanna/716F26140AED9B67/datasets/GSM8K"
+LOGGER = logging.getLogger("train_teacher_unsloth")
 
 
 SYSTEM_PROMPT = (
     "You are a careful math tutor. Solve step by step and end with "
     "'The answer is <number>.'."
 )
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +38,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split", choices=["train", "test"], default="train")
     p.add_argument("--max-train-samples", type=int, default=0)
     p.add_argument("--max-eval-samples", type=int, default=256)
+    p.add_argument("--train-jsonl", type=str, default=None, help="Optional JSONL with question/answer for training.")
+    p.add_argument("--eval-jsonl", type=str, default=None, help="Optional JSONL with question/answer for eval.")
     p.add_argument("--output-dir", type=str, default="newoutput/teacher-gsm8k-unsloth-lora")
     p.add_argument("--merged-output-dir", type=str, default="newoutput/teacher-gsm8k-unsloth-merged")
 
@@ -43,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--logging-steps", type=int, default=10)
     p.add_argument("--save-steps", type=int, default=1000)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--answer-style",
+        choices=["cot_final_marker", "raw"],
+        default="cot_final_marker",
+        help="Target style for assistant answer text.",
+    )
 
     p.add_argument(
         "--merge-16bit",
@@ -100,16 +122,56 @@ def resolve_split_arrow(dataset_path: str, split: str) -> Path:
 def load_gsm8k(split: str, dataset_path: str) -> Dataset:
     try:
         split_arrow = resolve_split_arrow(dataset_path, split)
-        print(f"[DATA] Using local Arrow split: {split_arrow}")
+        LOGGER.info("DATA using local Arrow split: %s", split_arrow)
         return Dataset.from_file(str(split_arrow))
     except FileNotFoundError:
-        print("[DATA] Local Arrow not found, falling back to Hugging Face openai/gsm8k")
+        LOGGER.info("DATA local Arrow not found, falling back to Hugging Face openai/gsm8k")
         return load_dataset("openai/gsm8k", "main", split=split)
 
 
-def _format_row(question: str, answer: str) -> str:
-    question = question.strip()
+def load_jsonl_dataset(path: str) -> Dataset:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"JSONL dataset not found: {p}")
+    ds = load_dataset("json", data_files=str(p), split="train")
+    if "question" not in ds.column_names or "answer" not in ds.column_names:
+        raise ValueError(f"JSONL must contain 'question' and 'answer' fields: {p}")
+    return ds
+
+
+def _extract_final_number(answer: str) -> str | None:
+    marker = re.search(r"####\s*([^\n\r]+)", answer)
+    if marker:
+        tail = marker.group(1)
+        nums = re.findall(r"-?[0-9]+(?:\.[0-9]+)?", tail.replace(",", ""))
+        if nums:
+            return nums[-1]
+    answer_marker = re.search(r"(?is)the answer is\s*(-?[0-9]+(?:\.[0-9]+)?)", answer)
+    if answer_marker:
+        return answer_marker.group(1)
+    nums = re.findall(r"-?[0-9]+(?:\.[0-9]+)?", answer.replace(",", ""))
+    return nums[-1] if nums else None
+
+
+def _normalize_answer(answer: str, style: str) -> str:
     answer = answer.strip()
+    if style == "raw":
+        return answer
+
+    rationale = answer
+    if "####" in rationale:
+        rationale = rationale.split("####", 1)[0].strip()
+    rationale = re.sub(r"\s+", " ", rationale).strip()
+    final_num = _extract_final_number(answer)
+    marker = f"The answer is {final_num}." if final_num is not None else "The answer is [unknown]."
+    if rationale:
+        return f"{rationale}\n{marker}"
+    return marker
+
+
+def _format_row(question: str, answer: str, answer_style: str) -> str:
+    question = question.strip()
+    answer = _normalize_answer(answer, answer_style)
     return (
         f"<|system|>\\n{SYSTEM_PROMPT}\\n"
         f"<|user|>\\n{question}\\n"
@@ -117,11 +179,11 @@ def _format_row(question: str, answer: str) -> str:
     )
 
 
-def prepare_dataset(ds: Dataset) -> Dataset:
+def prepare_dataset(ds: Dataset, answer_style: str) -> Dataset:
     def _mapper(row: dict) -> dict:
         q = str(row.get("question", "")).strip()
         a = str(row.get("answer", "")).strip()
-        return {"text": _format_row(q, a)}
+        return {"text": _format_row(q, a, answer_style)}
 
     return ds.map(_mapper, remove_columns=ds.column_names)
 
@@ -129,7 +191,29 @@ def prepare_dataset(ds: Dataset) -> Dataset:
 def resolve_base_model_ref(model_ref: str) -> str:
     local_path = Path(model_ref).expanduser()
     if local_path.exists():
-        return str(local_path.resolve())
+        p = local_path.resolve()
+        # Handle HF cache-root layout:
+        #   models--ORG--NAME/{refs,snapshots/<rev>/...}
+        if p.is_dir() and (p / "snapshots").is_dir() and (p / "refs").is_dir():
+            snap_root = p / "snapshots"
+            chosen: Path | None = None
+            ref_main = p / "refs" / "main"
+            if ref_main.exists():
+                rev = ref_main.read_text(encoding="utf-8").strip()
+                cand = snap_root / rev
+                if cand.is_dir():
+                    chosen = cand
+            if chosen is None:
+                snaps = sorted(
+                    [d for d in snap_root.iterdir() if d.is_dir()],
+                    key=lambda d: d.stat().st_mtime,
+                    reverse=True,
+                )
+                if snaps:
+                    chosen = snaps[0]
+            if chosen is not None:
+                p = chosen
+        return str(p)
     try:
         from huggingface_hub import snapshot_download
 
@@ -143,6 +227,7 @@ def resolve_base_model_ref(model_ref: str) -> str:
 
 
 def main() -> None:
+    configure_logging()
     args = parse_args()
 
     try:
@@ -156,22 +241,22 @@ def main() -> None:
         ) from exc
 
     resolved_base_model = resolve_base_model_ref(args.base_model)
-    print(f"[CFG] base_model={args.base_model}")
+    LOGGER.info("CFG base_model=%s", args.base_model)
     if resolved_base_model != args.base_model:
-        print(f"[CFG] resolved_base_model={resolved_base_model}")
-    print(f"[CFG] split={args.split} max_train_samples={args.max_train_samples}")
+        LOGGER.info("CFG resolved_base_model=%s", resolved_base_model)
+    LOGGER.info("CFG split=%s max_train_samples=%s", args.split, args.max_train_samples)
 
-    train_raw = load_gsm8k(args.split, args.dataset_path)
+    train_raw = load_jsonl_dataset(args.train_jsonl) if args.train_jsonl else load_gsm8k(args.split, args.dataset_path)
     if args.max_train_samples > 0:
         train_raw = train_raw.select(range(min(args.max_train_samples, len(train_raw))))
 
-    eval_raw = load_gsm8k("test", args.dataset_path)
+    eval_raw = load_jsonl_dataset(args.eval_jsonl) if args.eval_jsonl else load_gsm8k("test", args.dataset_path)
     if args.max_eval_samples > 0:
         eval_raw = eval_raw.select(range(min(args.max_eval_samples, len(eval_raw))))
 
-    train_ds = prepare_dataset(train_raw)
-    eval_ds = prepare_dataset(eval_raw)
-    print(f"[DATA] train={len(train_ds):,} eval={len(eval_ds):,}")
+    train_ds = prepare_dataset(train_raw, args.answer_style)
+    eval_ds = prepare_dataset(eval_raw, args.answer_style)
+    LOGGER.info("DATA train=%s eval=%s", f"{len(train_ds):,}", f"{len(eval_ds):,}")
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=resolved_base_model,
@@ -228,17 +313,17 @@ def main() -> None:
         args=sft_config,
     )
 
-    print("[TRAIN] Starting Unsloth LoRA fine-tune...")
+    LOGGER.info("TRAIN starting Unsloth LoRA fine-tune...")
     trainer.train()
 
-    print(f"[SAVE] Saving LoRA adapters to {out_dir}")
+    LOGGER.info("SAVE LoRA adapters to %s", out_dir)
     model.save_pretrained(str(out_dir))
     tokenizer.save_pretrained(str(out_dir))
 
     if args.merge_16bit:
         merged_dir = Path(args.merged_output_dir)
         merged_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[SAVE] Saving merged 16-bit model to {merged_dir}")
+        LOGGER.info("SAVE merged 16-bit model to %s", merged_dir)
         model.save_pretrained_merged(str(merged_dir), tokenizer, save_method="merged_16bit")
         merged_files = list(merged_dir.glob("*"))
         if not merged_files:
@@ -248,7 +333,7 @@ def main() -> None:
                 "Try passing a local model path with --base-model."
             )
 
-    print("[DONE] Teacher fine-tune complete.")
+    LOGGER.info("DONE teacher fine-tune complete.")
 
 
 if __name__ == "__main__":

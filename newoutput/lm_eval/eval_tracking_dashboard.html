@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Eval Tracking Dashboard</title>
+  <style>
+    body { font-family: "IBM Plex Sans", "Segoe UI", Arial, sans-serif; margin: 24px; background: #f6f7fb; color: #102030; }
+    h1 { margin: 0 0 12px; }
+    .meta { margin: 0 0 16px; color: #345; }
+    table { width: 100%; border-collapse: collapse; background: #fff; }
+    th, td { border: 1px solid #dfe3eb; padding: 8px; font-size: 13px; text-align: left; }
+    th { background: #eef2f8; position: sticky; top: 0; }
+    tr:nth-child(even) td { background: #fbfcff; }
+  </style>
+</head>
+<body>
+  <h1>Eval Tracking Dashboard</h1>
+  <p class="meta">Runs: 4 | Teacher optimization runs: 3</p>
+  <h2>Teacher Optimization Ranking</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Rank</th>
+        <th>Eval Name</th>
+        <th>Stage</th>
+        <th>Teacher EM</th>
+        <th>Student EM</th>
+        <th>Delta</th>
+        <th>Cycle</th>
+        <th>Epochs</th>
+        <th>LR</th>
+        <th>Seq</th>
+        <th>Created UTC</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>teacher-sft-c2_top1_e1.5_lr3.75e-05_r16_s2048-v1</td><td>teacher-sft</td><td>0.721759</td><td>0.347991</td><td>0.373768</td><td>2</td><td>1.5</td><td>3.75e-05</td><td>2048</td><td>2026-03-29T10:38:40.732908+00:00</td></tr><tr><td>2</td><td>teacher-sft-c2_top1_e2.0_lr3.75e-05_r16_s2048-v1</td><td>teacher-sft</td><td>0.703563</td><td>0.347991</td><td>0.355572</td><td>2</td><td>2.0</td><td>3.75e-05</td><td>2048</td><td>2026-03-29T13:41:53.532412+00:00</td></tr><tr><td>3</td><td>teacher-sft-c1_e2.0_lr5e-5_r16_s2048-v1</td><td>teacher-sft</td><td>0.702047</td><td>0.347991</td><td>0.354056</td><td>1</td><td>2.0</td><td>5e-05</td><td>2048</td><td>2026-03-29T02:06:42.293583+00:00</td></tr>
+    </tbody>
+  </table>
+  <h2>All Runs Timeline</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Experiment</th>
+        <th>Run ID</th>
+        <th>Stage</th>
+        <th>Eval Name</th>
+        <th>Teacher EM</th>
+        <th>Student EM</th>
+        <th>Delta</th>
+        <th>Created UTC</th>
+        <th>comparison.json</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>before-distill</td><td>v2</td><td>before-distill</td><td>before-distill-before-distill-v2</td><td>0.743745</td><td>0.347991</td><td>0.395754</td><td>2026-03-28T20:16:11.735109+00:00</td><td>newoutput/lm_eval/before-distill-before-distill-v2/comparison.json</td></tr><tr><td>optimize-loop</td><td>v1</td><td>teacher-sft</td><td>teacher-sft-c1_e2.0_lr5e-5_r16_s2048-v1</td><td>0.702047</td><td>0.347991</td><td>0.354056</td><td>2026-03-29T02:06:42.293583+00:00</td><td>newoutput/lm_eval/teacher-sft-c1_e2.0_lr5e-5_r16_s2048-v1/comparison.json</td></tr><tr><td>optimize-loop</td><td>v1</td><td>teacher-sft</td><td>teacher-sft-c2_top1_e1.5_lr3.75e-05_r16_s2048-v1</td><td>0.721759</td><td>0.347991</td><td>0.373768</td><td>2026-03-29T10:38:40.732908+00:00</td><td>newoutput/lm_eval/teacher-sft-c2_top1_e1.5_lr3.75e-05_r16_s2048-v1/comparison.json</td></tr><tr><td>optimize-loop</td><td>v1</td><td>teacher-sft</td><td>teacher-sft-c2_top1_e2.0_lr3.75e-05_r16_s2048-v1</td><td>0.703563</td><td>0.347991</td><td>0.355572</td><td>2026-03-29T13:41:53.532412+00:00</td><td>newoutput/lm_eval/teacher-sft-c2_top1_e2.0_lr3.75e-05_r16_s2048-v1/comparison.json</td></tr>
+    </tbody>
+  </table>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "run_id": "v1",
+  "stage": "teacher-sft",
+  "experiment": "optimize-loop",
+  "parent_eval": "teacher-sft-c1_e2.0_lr5e-5_r16_s2048-v1",
+  "notes": "",
+  "created_at_utc": "2026-03-29T10:38:40.732908+00:00",
+  "eval_name": "teacher-sft-c2_top1_e1.5_lr3.75e-05_r16_s2048-v1"
+}

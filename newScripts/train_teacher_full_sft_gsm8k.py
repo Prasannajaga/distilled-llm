@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+import torch
+from datasets import Dataset, load_dataset
+
+DEFAULT_BASE_MODEL = "/media/prasanna/716F26140AED9B67/models/models--Qwen--Qwen2-Math-1.5B-Instruct"
+DEFAULT_DATASET_PATH = "/media/prasanna/716F26140AED9B67/datasets/GSM8K"
+LOGGER = logging.getLogger("train_teacher_full_sft")
+
+
+SYSTEM_PROMPT = (
+    "You are a careful math tutor. Solve step by step and end with "
+    "'The answer is <number>.'."
+)
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Full SFT teacher fine-tune on GSM8K (no LoRA)")
+    p.add_argument("--base-model", type=str, default=DEFAULT_BASE_MODEL)
+    p.add_argument("--dataset-path", type=str, default=DEFAULT_DATASET_PATH)
+    p.add_argument("--split", choices=["train", "test"], default="train")
+    p.add_argument("--max-train-samples", type=int, default=0)
+    p.add_argument("--max-eval-samples", type=int, default=256)
+    p.add_argument("--train-jsonl", type=str, default=None, help="Optional JSONL with question/answer for training.")
+    p.add_argument("--eval-jsonl", type=str, default=None, help="Optional JSONL with question/answer for eval.")
+    p.add_argument("--output-dir", type=str, default="output/teacher-gsm8k-full-sft")
+    p.add_argument("--merged-output-dir", type=str, default="output/teacher-gsm8k-full-sft")
+
+    p.add_argument("--max-seq-length", type=int, default=2048)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--grad-accum", type=int, default=16)
+    p.add_argument("--epochs", type=float, default=2.0)
+    p.add_argument("--learning-rate", type=float, default=5e-5)
+    p.add_argument("--warmup-ratio", type=float, default=0.05)
+    p.add_argument("--weight-decay", type=float, default=0.01)
+    p.add_argument("--logging-steps", type=int, default=10)
+    p.add_argument("--save-steps", type=int, default=200)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--gradient-checkpointing", type=int, choices=[0, 1], default=1)
+    p.add_argument(
+        "--answer-style",
+        choices=["cot_final_marker", "raw"],
+        default="cot_final_marker",
+        help="Target style for assistant answer text.",
+    )
+    p.add_argument(
+        "--merge-16bit",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="Compatibility flag. For full SFT, this just ensures model files exist in merged-output-dir.",
+    )
+    return p.parse_args()
+
+
+def _search_arrow(root: Path, split: str) -> Path | None:
+    if not root.exists() or not root.is_dir():
+        return None
+    target_name = f"gsm8k-{split}.arrow"
+    direct = root / target_name
+    if direct.exists():
+        return direct
+    matches = sorted(root.rglob(target_name))
+    return matches[0] if matches else None
+
+
+def resolve_split_arrow(dataset_path: str, split: str) -> Path:
+    requested = Path(dataset_path)
+    target_name = f"gsm8k-{split}.arrow"
+
+    if requested.exists():
+        if requested.is_file():
+            if requested.name != target_name:
+                raise FileNotFoundError(
+                    f"Expected file name {target_name} for split '{split}', got: {requested}"
+                )
+            return requested
+        found = _search_arrow(requested, split)
+        if found is not None:
+            return found
+
+    fallback_roots = [
+        Path("/media/prasanna/716F26140AED9B67/datasets/openai___gsm8k"),
+        Path("/media/prasanna/716F26140AED9B67/datasets/openai___gsm8k/main"),
+    ]
+    if requested.name.lower() == "gsm8k":
+        fallback_roots = [requested.parent / "openai___gsm8k", requested.parent / "openai___gsm8k" / "main"] + fallback_roots
+
+    for root in fallback_roots:
+        found = _search_arrow(root, split)
+        if found is not None:
+            return found
+
+    raise FileNotFoundError(
+        f"Could not locate {target_name}. Checked {requested} and standard openai___gsm8k fallbacks."
+    )
+
+
+def load_gsm8k(split: str, dataset_path: str) -> Dataset:
+    try:
+        split_arrow = resolve_split_arrow(dataset_path, split)
+        LOGGER.info("DATA using local Arrow split: %s", split_arrow)
+        return Dataset.from_file(str(split_arrow))
+    except FileNotFoundError:
+        LOGGER.info("DATA local Arrow not found, falling back to Hugging Face openai/gsm8k")
+        return load_dataset("openai/gsm8k", "main", split=split)
+
+
+def load_jsonl_dataset(path: str) -> Dataset:
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"JSONL dataset not found: {p}")
+    ds = load_dataset("json", data_files=str(p), split="train")
+    if "question" not in ds.column_names or "answer" not in ds.column_names:
+        raise ValueError(f"JSONL must contain 'question' and 'answer' fields: {p}")
+    return ds
+
+
+def _extract_final_number(answer: str) -> str | None:
+    marker = re.search(r"####\s*([^\n\r]+)", answer)
+    if marker:
+        tail = marker.group(1)
+        nums = re.findall(r"-?[0-9]+(?:\.[0-9]+)?", tail.replace(",", ""))
+        if nums:
+            return nums[-1]
+    answer_marker = re.search(r"(?is)the answer is\s*(-?[0-9]+(?:\.[0-9]+)?)", answer)
+    if answer_marker:
+        return answer_marker.group(1)
+    nums = re.findall(r"-?[0-9]+(?:\.[0-9]+)?", answer.replace(",", ""))
+    return nums[-1] if nums else None
+
+
+def _normalize_answer(answer: str, style: str) -> str:
+    answer = answer.strip()
+    if style == "raw":
+        return answer
+
+    rationale = answer
+    if "####" in rationale:
+        rationale = rationale.split("####", 1)[0].strip()
+    rationale = re.sub(r"\s+", " ", rationale).strip()
+    final_num = _extract_final_number(answer)
+    marker = f"The answer is {final_num}." if final_num is not None else "The answer is [unknown]."
+    if rationale:
+        return f"{rationale}\n{marker}"
+    return marker
+
+
+def _format_row(question: str, answer: str, answer_style: str) -> str:
+    question = question.strip()
+    answer = _normalize_answer(answer, answer_style)
+    return (
+        f"<|system|>\n{SYSTEM_PROMPT}\n"
+        f"<|user|>\n{question}\n"
+        f"<|assistant|>\n{answer}"
+    )
+
+
+def prepare_dataset(ds: Dataset, answer_style: str) -> Dataset:
+    def _mapper(row: dict) -> dict:
+        q = str(row.get("question", "")).strip()
+        a = str(row.get("answer", "")).strip()
+        return {"text": _format_row(q, a, answer_style)}
+
+    return ds.map(_mapper, remove_columns=ds.column_names)
+
+
+def resolve_base_model_ref(model_ref: str) -> str:
+    local_path = Path(model_ref).expanduser()
+    if local_path.exists():
+        p = local_path.resolve()
+        if p.is_dir() and (p / "snapshots").is_dir() and (p / "refs").is_dir():
+            snap_root = p / "snapshots"
+            chosen: Path | None = None
+            ref_main = p / "refs" / "main"
+            if ref_main.exists():
+                rev = ref_main.read_text(encoding="utf-8").strip()
+                cand = snap_root / rev
+                if cand.is_dir():
+                    chosen = cand
+            if chosen is None:
+                snaps = sorted(
+                    [d for d in snap_root.iterdir() if d.is_dir()],
+                    key=lambda d: d.stat().st_mtime,
+                    reverse=True,
+                )
+                if snaps:
+                    chosen = snaps[0]
+            if chosen is not None:
+                p = chosen
+        return str(p)
+    return model_ref
+
+
+def main() -> None:
+    configure_logging()
+    args = parse_args()
+
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from trl import SFTConfig, SFTTrainer
+    except Exception as exc:
+        raise RuntimeError(
+            "Missing training deps. Install with:\n"
+            "  uv pip install transformers trl accelerate datasets huggingface_hub\n"
+            f"Original import error: {exc}"
+        ) from exc
+
+    resolved_base_model = resolve_base_model_ref(args.base_model)
+    LOGGER.info("CFG base_model=%s", args.base_model)
+    if resolved_base_model != args.base_model:
+        LOGGER.info("CFG resolved_base_model=%s", resolved_base_model)
+    LOGGER.info("CFG split=%s max_train_samples=%s", args.split, args.max_train_samples)
+
+    train_raw = load_jsonl_dataset(args.train_jsonl) if args.train_jsonl else load_gsm8k(args.split, args.dataset_path)
+    if args.max_train_samples > 0:
+        train_raw = train_raw.select(range(min(args.max_train_samples, len(train_raw))))
+
+    eval_raw = load_jsonl_dataset(args.eval_jsonl) if args.eval_jsonl else load_gsm8k("test", args.dataset_path)
+    if args.max_eval_samples > 0:
+        eval_raw = eval_raw.select(range(min(args.max_eval_samples, len(eval_raw))))
+
+    train_ds = prepare_dataset(train_raw, args.answer_style)
+    eval_ds = prepare_dataset(eval_raw, args.answer_style)
+    LOGGER.info("DATA train=%s eval=%s", f"{len(train_ds):,}", f"{len(eval_ds):,}")
+
+    tokenizer = AutoTokenizer.from_pretrained(resolved_base_model, trust_remote_code=True)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    use_cuda = torch.cuda.is_available()
+    bf16_ok = bool(use_cuda and torch.cuda.is_bf16_supported())
+    dtype = torch.bfloat16 if bf16_ok else (torch.float16 if use_cuda else torch.float32)
+    LOGGER.info("CFG torch_dtype=%s bf16=%s", dtype, bf16_ok)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        resolved_base_model,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+    )
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sft_config = SFTConfig(
+        output_dir=str(out_dir),
+        dataset_text_field="text",
+        max_seq_length=args.max_seq_length,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.learning_rate,
+        warmup_ratio=args.warmup_ratio,
+        weight_decay=args.weight_decay,
+        lr_scheduler_type="cosine",
+        optim="adamw_torch",
+        logging_steps=args.logging_steps,
+        save_steps=args.save_steps,
+        eval_steps=max(args.logging_steps, 50),
+        evaluation_strategy="steps",
+        bf16=bf16_ok,
+        fp16=(use_cuda and not bf16_ok),
+        gradient_checkpointing=bool(args.gradient_checkpointing),
+        seed=args.seed,
+        report_to="none",
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        args=sft_config,
+    )
+
+    LOGGER.info("TRAIN starting full SFT fine-tune...")
+    trainer.train()
+
+    LOGGER.info("SAVE full model to %s", out_dir)
+    trainer.save_model(str(out_dir))
+    tokenizer.save_pretrained(str(out_dir))
+
+    if args.merge_16bit:
+        merged_dir = Path(args.merged_output_dir)
+        merged_dir.mkdir(parents=True, exist_ok=True)
+        if out_dir.resolve() != merged_dir.resolve():
+            LOGGER.info("SAVE copying full model to merged dir %s", merged_dir)
+            shutil.copytree(out_dir, merged_dir, dirs_exist_ok=True)
+        else:
+            LOGGER.info("SAVE merged dir is output dir: %s", merged_dir)
+
+    LOGGER.info("DONE teacher full SFT complete.")
+
+
+if __name__ == "__main__":
+    main()

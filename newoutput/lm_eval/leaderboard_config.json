@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "primary_metric": "teacher_exact_match",
+  "secondary_metric": "delta_teacher_minus_student",
+  "sort_order": "desc",
+  "registry_file": "newoutput/lm_eval/leaderboard.jsonl"
+}
