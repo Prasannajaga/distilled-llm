@@ -4,18 +4,45 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import logging
+import os
 import re
 import shutil
 import subprocess
+import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from datasets import Dataset, load_dataset
 
-DEFAULT_STUDENT_MODEL = "Qwen/Qwen2-0.5B-Instruct"
-DEFAULT_TEACHER_MODEL = "Qwen/Qwen2-Math-1.5B-Instruct"
+DEFAULT_STUDENT_MODEL = "/media/prasanna/716F26140AED9B67/models/models--Qwen--Qwen2-0.5B-Instruct"
+DEFAULT_TEACHER_MODEL = "/media/prasanna/716F26140AED9B67/models/models--Qwen--Qwen2-Math-1.5B-Instruct"
 DEFAULT_GSM8K_PATH = "/media/prasanna/716F26140AED9B67/datasets/GSM8K"
+LOGGER = logging.getLogger("run_lm_eval_custom")
+COMMAND_TAIL_LINES = 25
+HEARTBEAT_SECONDS = 30
+ECHO_SUBPROCESS = False
+
+
+def log_state(state: str, **fields: Any) -> None:
+    payload = " ".join(f"{k}={fields[k]}" for k in sorted(fields))
+    if payload:
+        LOGGER.info("STATE | %s | %s", state, payload)
+    else:
+        LOGGER.info("STATE | %s", state)
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(message)s",
+        datefmt="%H:%M:%S",
+        stream=sys.stdout,
+        force=True,
+    )
 
 
 def utc_now() -> str:
@@ -33,7 +60,46 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=str, default="1")
     p.add_argument("--limit", type=str, default=None, help="lm-eval limit, e.g. 100 or 0.1")
     p.add_argument("--num-fewshot", type=int, default=8)
-    p.add_argument("--gen-max-toks", type=int, default=64)
+    p.add_argument("--gen-max-toks", type=int, default=256)
+    p.add_argument("--retry-count", type=int, default=1, help="Retries per lm-eval subprocess command.")
+    p.add_argument(
+        "--teacher-fallback-device",
+        type=str,
+        default="cuda:0",
+        help="Fallback device if teacher lm-eval command fails after retries.",
+    )
+    p.add_argument(
+        "--teacher-fallback-max-gen-toks",
+        type=int,
+        default=128,
+        help="Fallback max_gen_toks if teacher lm-eval command fails after retries.",
+    )
+    p.add_argument(
+        "--student-fallback-device",
+        type=str,
+        default="cuda:0",
+        help="Fallback device if student lm-eval command fails after retries.",
+    )
+    p.add_argument(
+        "--gpu-optimize-6gb",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="If 1, apply RTX 4050 6GB-friendly CUDA retry tuning before any CPU fallback.",
+    )
+    p.add_argument(
+        "--student-fallback-max-gen-toks",
+        type=int,
+        default=128,
+        help="Fallback max_gen_toks if student lm-eval command fails after retries.",
+    )
+    p.add_argument(
+        "--fewshot-cot",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="If 1, few-shot exemplars include full GSM8K worked answers; if 0, numeric target only.",
+    )
     p.add_argument(
         "--sample-comparison-limit",
         type=int,
@@ -50,6 +116,36 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Run name for output folder and task naming (no timestamp suffix auto-added).",
+    )
+    p.add_argument(
+        "--stage",
+        type=str,
+        default="adhoc",
+        help="Pipeline stage label, e.g. before-distill, teacher-sft, after-distill.",
+    )
+    p.add_argument(
+        "--experiment",
+        type=str,
+        default="default",
+        help="Experiment group name used for tracking and dashboards.",
+    )
+    p.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Optional stable run id for cross-stage linking.",
+    )
+    p.add_argument(
+        "--parent-eval",
+        type=str,
+        default=None,
+        help="Optional parent eval name (for lineage tracking).",
+    )
+    p.add_argument(
+        "--notes",
+        type=str,
+        default="",
+        help="Optional free-text notes attached to this eval run.",
     )
     p.add_argument(
         "--overwrite-output",
@@ -182,7 +278,14 @@ def to_jsonl_from_hf(split: str, out_jsonl: Path, max_samples: int) -> int:
     return count
 
 
-def write_task_yaml(task_path: Path, data_jsonl: Path, num_fewshot: int, task_name: str) -> str:
+def write_task_yaml(
+    task_path: Path,
+    data_jsonl: Path,
+    num_fewshot: int,
+    task_name: str,
+    fewshot_cot: bool,
+) -> str:
+    doc_to_target = "{{answer}}" if fewshot_cot else "{{answer.split('####')[-1].strip()}}"
     yaml = f"""task: {task_name}
 dataset_path: json
 dataset_kwargs:
@@ -196,9 +299,15 @@ doc_to_text: |
   Q: {{{{question}}}}
 
   A:
-doc_to_target: "{{{{answer.split('####')[-1].strip()}}}}"
+doc_to_target: "{doc_to_target}"
 num_fewshot: {num_fewshot}
 filter_list:
+  - name: marker-priority
+    filter:
+      - function: regex
+        group_select: -1
+        regex_pattern: '(?is)The answer is\\s*(-?[0-9.,]+)|####\\s*(-?[0-9.,]+)|(-?[$0-9.,]{{2,}})|(-?[0-9]+)'
+      - function: take_first
   - name: strict-match
     filter:
       - function: regex
@@ -234,9 +343,106 @@ metadata:
     return task_name
 
 
-def run_cmd(cmd: list[str], cwd: Path) -> None:
-    print("[CMD]", " ".join(cmd))
-    subprocess.run(cmd, cwd=str(cwd), check=True)
+def run_cmd(cmd: list[str], cwd: Path, retries: int = 0, env: dict[str, str] | None = None) -> None:
+    LOGGER.info("CMD: %s", " ".join(cmd))
+    last_exc: subprocess.CalledProcessError | None = None
+    for attempt in range(retries + 1):
+        start = time.perf_counter()
+        tail: list[str] = []
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+            assert proc.stdout is not None
+            def _reader() -> None:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    msg = line.rstrip("\n")
+                    tail.append(msg)
+                    if len(tail) > COMMAND_TAIL_LINES:
+                        del tail[:-COMMAND_TAIL_LINES]
+                    if ECHO_SUBPROCESS:
+                        print(msg)
+
+            t = threading.Thread(target=_reader, daemon=True)
+            t.start()
+            while proc.poll() is None:
+                time.sleep(HEARTBEAT_SECONDS)
+                elapsed = time.perf_counter() - start
+                last_line = tail[-1] if tail else "(no output yet)"
+                LOGGER.info("Still running (%.1fs): %s", elapsed, last_line[:200])
+            t.join(timeout=5)
+            rc = proc.wait()
+            if rc != 0:
+                raise subprocess.CalledProcessError(rc, cmd)
+            elapsed = time.perf_counter() - start
+            LOGGER.info("Command succeeded in %.2fs", elapsed)
+            return
+        except subprocess.CalledProcessError as exc:
+            last_exc = exc
+            LOGGER.warning("Command failed (attempt %d/%d) rc=%s", attempt + 1, retries + 1, exc.returncode)
+            if tail:
+                LOGGER.warning("Last %d output lines:\n%s", len(tail), "\n".join(tail))
+            if attempt < retries:
+                continue
+    assert last_exc is not None
+    raise last_exc
+
+
+def _replace_flag_value(cmd: list[str], flag: str, new_value: str) -> list[str]:
+    out = cmd[:]
+    if flag in out:
+        i = out.index(flag)
+        if i + 1 < len(out):
+            out[i + 1] = new_value
+    return out
+
+
+def _append_model_args(cmd: list[str], extras: list[str]) -> list[str]:
+    out = cmd[:]
+    if "--model_args" not in out:
+        return out
+    i = out.index("--model_args")
+    if i + 1 >= len(out):
+        return out
+    current = out[i + 1]
+    parts = [p.strip() for p in current.split(",") if p.strip()]
+    kv: dict[str, str] = {}
+    ordered_keys: list[str] = []
+    for p in parts:
+        if "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        k = k.strip()
+        if not k:
+            continue
+        if k not in kv:
+            ordered_keys.append(k)
+        kv[k] = v.strip()
+    for item in extras:
+        if "=" not in item:
+            continue
+        key, val = item.split("=", 1)
+        key = key.strip()
+        val = val.strip()
+        if not key:
+            continue
+        if key not in kv:
+            ordered_keys.append(key)
+        kv[key] = val
+    out[i + 1] = ",".join([f"{k}={kv[k]}" for k in ordered_keys])
+    return out
+
+
+def _merge_model_arg_list(base: list[str], extras: list[str]) -> list[str]:
+    merged = _append_model_args(["--model_args", ",".join(base)], extras)[1]
+    return [p for p in merged.split(",") if p]
 
 
 def ensure_lm_eval_installed() -> None:
@@ -326,10 +532,12 @@ def normalize_model_artifacts(model_out_dir: Path) -> tuple[Path | None, Path | 
 
 def _filter_rank(filter_name: Any) -> int:
     name = str(filter_name or "").strip().lower()
-    if name == "flexible-extract":
+    if name == "marker-priority":
         return 0
-    if name == "strict-match":
+    if name == "flexible-extract":
         return 1
+    if name == "strict-match":
+        return 2
     return 10
 
 
@@ -387,17 +595,32 @@ def _extract_triplet(sample_row: dict[str, Any]) -> tuple[str, str, str, str]:
         else:
             raw_pred = str(first)
 
-    extracted_pred = ""
-    fresps = sample_row.get("filtered_resps")
-    if isinstance(fresps, list) and fresps:
-        extracted_pred = str(fresps[0])
-    if extracted_pred.strip().lower() == "[invalid]":
-        extracted_pred = ""
+    extracted_pred = _extract_priority_answer(raw_pred)
+    if not extracted_pred:
+        fresps = sample_row.get("filtered_resps")
+        if isinstance(fresps, list) and fresps:
+            extracted_pred = str(fresps[0])
+        if extracted_pred.strip().lower() == "[invalid]":
+            extracted_pred = ""
     return question, gold, extracted_pred, raw_pred
 
 
+def _extract_priority_answer(text: str) -> str:
+    if not text:
+        return ""
+    marker = re.search(r"(?is)the answer is\s*(-?[0-9]+(?:\.[0-9]+)?(?:,[0-9]{3})*)", text)
+    if marker:
+        return marker.group(1).strip()
+    hash_marker = re.search(r"####\s*(-?[0-9]+(?:\.[0-9]+)?(?:,[0-9]{3})*)", text)
+    if hash_marker:
+        return hash_marker.group(1).strip()
+    nums = re.findall(r"-?[0-9]+(?:\.[0-9]+)?", text.replace(",", ""))
+    return nums[-1] if nums else ""
+
+
 def _norm_text(x: str) -> str:
-    s = x.strip().lower()
+    preferred = _extract_priority_answer(x)
+    s = preferred if preferred else x.strip().lower()
     m = re.search(r"####\s*([^\n\r]+)", s)
     if m:
         s = m.group(1).strip()
@@ -537,7 +760,7 @@ def extract_score(result_json: Path, task_name: str) -> tuple[float | None, str 
     if not isinstance(task, dict):
         return None, None
 
-    preferred = ("exact_match,flexible-extract", "exact_match")
+    preferred = ("exact_match,marker-priority", "exact_match,flexible-extract", "exact_match")
     for key in preferred:
         val = task.get(key)
         if isinstance(val, (int, float)):
@@ -597,6 +820,21 @@ def update_leaderboard(root_dir: Path, summary: dict[str, Any]) -> None:
         "registry_file": str(lb_jsonl),
     }
     (root_dir / "leaderboard_config.json").write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def update_tracking_registry(root_dir: Path, summary: dict[str, Any]) -> None:
+    """
+    Append a stable run record and keep lightweight pointers for latest-per-stage.
+    """
+    root_dir.mkdir(parents=True, exist_ok=True)
+    reg = root_dir / "eval_tracking_registry.jsonl"
+    with reg.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+
+    stage = slugify(str(summary.get("stage", "adhoc")))
+    latest_dir = root_dir / "_latest_by_stage"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    (latest_dir / f"{stage}.txt").write_text(str(summary.get("eval_name", "")) + "\n", encoding="utf-8")
 
 
 def resolve_model_ref(model_ref: str, local_only: bool) -> tuple[str, bool]:
@@ -659,15 +897,16 @@ def resolve_model_ref(model_ref: str, local_only: bool) -> tuple[str, bool]:
         return str(p), True
     inferred_repo = infer_hf_repo_id(model_ref)
     if inferred_repo:
-        print(
-            f"[INFO] Local model path not found: {model_ref}. "
-            f"Falling back to Hugging Face repo: {inferred_repo}"
+        LOGGER.info(
+            "Local model path not found: %s. Falling back to Hugging Face repo: %s",
+            model_ref,
+            inferred_repo,
         )
         return inferred_repo, False
     if local_only:
-        print(
-            f"[WARN] --local-models-only was set, but local model path was not found: {model_ref}. "
-            "Falling back to remote model resolution."
+        LOGGER.warning(
+            "--local-models-only was set, but local model path was not found: %s. Falling back to remote model resolution.",
+            model_ref,
         )
     return model_ref, False
 
@@ -679,8 +918,11 @@ def render_html_report(
     title: str,
     row_limit: int,
     per_eval_sample_limit: int,
-) -> Path:
+) -> Path | None:
     renderer_path = Path(__file__).with_name("render_lm_eval_html.py")
+    if not renderer_path.exists():
+        LOGGER.warning("HTML renderer not found at %s. Skipping report.html generation.", renderer_path)
+        return None
     spec = importlib.util.spec_from_file_location("render_lm_eval_html", renderer_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load html renderer module: {renderer_path}")
@@ -712,42 +954,70 @@ def render_html_report(
 
 
 def main() -> None:
+    configure_logging()
     args = parse_args()
+    log_state("eval_run_start", stage=args.stage, experiment=args.experiment, split=args.split)
     ensure_lm_eval_installed()
     base_root = Path("newoutput") / "lm_eval"
-    eval_name_raw = args.eval_name or "custom_gsm8k"
+    stage_slug = slugify(args.stage)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    eval_name_raw = args.eval_name or f"{stage_slug}-{ts}"
     eval_name = slugify(eval_name_raw)
     out_dir = Path(args.output_dir) if args.output_dir else (base_root / eval_name)
     eval_name_final = out_dir.name
+    run_id = args.run_id or f"{stage_slug}-{ts}"
+    log_state("output_resolved", out_dir=str(out_dir), eval_name=eval_name_final, run_id=run_id)
     if out_dir.exists() and any(out_dir.iterdir()) and args.overwrite_output:
+        log_state("output_overwrite_start", out_dir=str(out_dir))
         for child in out_dir.iterdir():
             if child.is_dir():
                 shutil.rmtree(child)
             else:
                 child.unlink()
+        log_state("output_overwrite_end", out_dir=str(out_dir))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     task_slug = taskify(eval_name_final)
     task_name = f"gsm8k_local_{task_slug}"
     data_jsonl = out_dir / f"{task_name}_{args.split}.jsonl"
     dataset_arrow_str: str
+    log_state("dataset_prepare_start", dataset_path=args.dataset_path, split=args.split)
     try:
         split_arrow = resolve_split_arrow(args.dataset_path, args.split)
         n_rows = to_jsonl_from_arrow(split_arrow, data_jsonl, args.max_samples)
         dataset_arrow_str = str(split_arrow)
+        log_state("dataset_prepare_end", source="arrow", rows=n_rows, jsonl=str(data_jsonl))
     except FileNotFoundError:
-        print(
-            f"[INFO] Dataset path not found/unusable: {args.dataset_path}. "
-            "Falling back to Hugging Face dataset openai/gsm8k (main)."
+        LOGGER.info(
+            "Dataset path not found/unusable: %s. Falling back to Hugging Face dataset openai/gsm8k (main).",
+            args.dataset_path,
         )
         n_rows = to_jsonl_from_hf(args.split, data_jsonl, args.max_samples)
         dataset_arrow_str = "hf://openai/gsm8k/main"
+        log_state("dataset_prepare_end", source="hf", rows=n_rows, jsonl=str(data_jsonl))
+
+    effective_num_fewshot = min(int(args.num_fewshot), max(0, int(n_rows) - 1))
+    if effective_num_fewshot != int(args.num_fewshot):
+        LOGGER.warning(
+            "Reducing num_fewshot from %s to %s because dataset rows=%s.",
+            args.num_fewshot,
+            effective_num_fewshot,
+            n_rows,
+        )
 
     task_yaml = out_dir / f"{task_name}.yaml"
-    task_name = write_task_yaml(task_yaml, data_jsonl, args.num_fewshot, task_name)
+    task_name = write_task_yaml(
+        task_yaml,
+        data_jsonl,
+        effective_num_fewshot,
+        task_name,
+        fewshot_cot=bool(args.fewshot_cot),
+    )
+    log_state("task_yaml_written", task_name=task_name, task_yaml=str(task_yaml))
 
     teacher_ref, teacher_is_local = resolve_model_ref(args.teacher_model, args.local_models_only)
     student_ref, student_is_local = resolve_model_ref(args.student_model, args.local_models_only)
+    log_state("model_refs_resolved", teacher_local=teacher_is_local, student_local=student_is_local)
 
     common = [
         "uv",
@@ -778,6 +1048,18 @@ def main() -> None:
 
     teacher_model_args = [f"pretrained={teacher_ref}", "trust_remote_code=True", "dtype=auto"]
     student_model_args = [f"pretrained={student_ref}", "trust_remote_code=True", "dtype=auto"]
+    if int(args.gpu_optimize_6gb) == 1 and str(args.device).startswith("cuda"):
+        offload_dir = out_dir / "offload"
+        offload_dir.mkdir(parents=True, exist_ok=True)
+        six_gb_profile = [
+            "dtype=float16",
+            "parallelize=True",
+            "max_memory_per_gpu=5GiB",
+            "max_cpu_memory=48GiB",
+            f"offload_folder={offload_dir}",
+        ]
+        teacher_model_args = _merge_model_arg_list(teacher_model_args, six_gb_profile)
+        student_model_args = _merge_model_arg_list(student_model_args, six_gb_profile)
     if args.local_models_only and teacher_is_local:
         teacher_model_args.append("local_files_only=True")
     if args.local_models_only and student_is_local:
@@ -797,29 +1079,145 @@ def main() -> None:
     ]
 
     if args.dry_run:
-        print("[DRY] teacher:", " ".join(teacher_cmd))
-        print("[DRY] student:", " ".join(student_cmd))
+        LOGGER.info("DRY teacher: %s", " ".join(teacher_cmd))
+        LOGGER.info("DRY student: %s", " ".join(student_cmd))
+        log_state("dry_run_end", teacher_cmd_len=len(teacher_cmd), student_cmd_len=len(student_cmd))
         return
 
-    run_cmd(teacher_cmd, Path.cwd())
-    run_cmd(student_cmd, Path.cwd())
+    rtx_4050_env = os.environ.copy()
+    rtx_4050_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+    teacher_eval_started = time.perf_counter()
+    log_state("teacher_eval_start", output=str(teacher_out))
+    try:
+        run_cmd(teacher_cmd, Path.cwd(), retries=max(0, int(args.retry_count)))
+    except subprocess.CalledProcessError:
+        fallback_gen_toks = max(16, int(args.teacher_fallback_max_gen_toks))
+        fallback_cmd = _replace_flag_value(teacher_cmd, "--device", str(args.teacher_fallback_device))
+        fallback_cmd = _replace_flag_value(
+            fallback_cmd,
+            "--gen_kwargs",
+            f"do_sample=False,temperature=0.0,max_gen_toks={fallback_gen_toks}",
+        )
+        fallback_env: dict[str, str] | None = None
+        if int(args.gpu_optimize_6gb) == 1 and str(args.teacher_fallback_device).startswith("cuda"):
+            LOGGER.warning(
+                "Teacher lm-eval failed. Applying RTX 4050 6GB CUDA profile (fp16 + allocator tuning) before fallback."
+            )
+            fallback_cmd = _append_model_args(fallback_cmd, ["dtype=float16"])
+            fallback_env = rtx_4050_env
+        LOGGER.warning(
+            "Teacher lm-eval failed after retries. Retrying with fallback device=%s max_gen_toks=%s.",
+            args.teacher_fallback_device,
+            fallback_gen_toks,
+        )
+        try:
+            run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env)
+        except subprocess.CalledProcessError:
+            if int(args.gpu_optimize_6gb) != 1 or not str(args.teacher_fallback_device).startswith("cuda"):
+                raise
+            offload_cmd = _append_model_args(
+                fallback_cmd,
+                [
+                    "parallelize=True",
+                    "max_memory_per_gpu=5GiB",
+                    "max_cpu_memory=48GiB",
+                ],
+            )
+            LOGGER.warning("Teacher CUDA retry still failed. Retrying with CUDA+CPU offload profile.")
+            run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env)
+    log_state("teacher_eval_end", output=str(teacher_out), elapsed_s=f"{(time.perf_counter() - teacher_eval_started):.2f}")
+
+    student_eval_started = time.perf_counter()
+    log_state("student_eval_start", output=str(student_out))
+    try:
+        run_cmd(student_cmd, Path.cwd(), retries=max(0, int(args.retry_count)))
+    except subprocess.CalledProcessError:
+        fallback_gen_toks = max(16, int(args.student_fallback_max_gen_toks))
+        fallback_cmd = _replace_flag_value(student_cmd, "--device", str(args.student_fallback_device))
+        fallback_cmd = _replace_flag_value(
+            fallback_cmd,
+            "--gen_kwargs",
+            f"do_sample=False,temperature=0.0,max_gen_toks={fallback_gen_toks}",
+        )
+        fallback_env: dict[str, str] | None = None
+        if int(args.gpu_optimize_6gb) == 1 and str(args.student_fallback_device).startswith("cuda"):
+            LOGGER.warning(
+                "Student lm-eval failed. Applying RTX 4050 6GB CUDA profile (fp16 + allocator tuning) before fallback."
+            )
+            fallback_cmd = _append_model_args(fallback_cmd, ["dtype=float16"])
+            fallback_env = rtx_4050_env
+        LOGGER.warning(
+            "Student lm-eval failed after retries. Retrying with fallback device=%s max_gen_toks=%s.",
+            args.student_fallback_device,
+            fallback_gen_toks,
+        )
+        try:
+            run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env)
+        except subprocess.CalledProcessError:
+            if int(args.gpu_optimize_6gb) != 1 or not str(args.student_fallback_device).startswith("cuda"):
+                raise
+            offload_cmd = _append_model_args(
+                fallback_cmd,
+                [
+                    "parallelize=True",
+                    "max_memory_per_gpu=5GiB",
+                    "max_cpu_memory=48GiB",
+                ],
+            )
+            LOGGER.warning("Student CUDA retry still failed. Retrying with CUDA+CPU offload profile.")
+            run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env)
+    log_state("student_eval_end", output=str(student_out), elapsed_s=f"{(time.perf_counter() - student_eval_started):.2f}")
+
+    log_state("artifact_normalize_start", teacher_out=str(teacher_out), student_out=str(student_out))
     teacher_res, teacher_samples = normalize_model_artifacts(teacher_out)
     student_res, student_samples = normalize_model_artifacts(student_out)
+    log_state(
+        "artifact_normalize_end",
+        teacher_results=str(teacher_res) if teacher_res else "none",
+        student_results=str(student_res) if student_res else "none",
+    )
 
-    t_score, t_metric_key = extract_score(teacher_res, task_name) if teacher_res else (None, None)
-    s_score, s_metric_key = extract_score(student_res, task_name) if student_res else (None, None)
+    lm_t_score, lm_t_metric_key = extract_score(teacher_res, task_name) if teacher_res else (None, None)
+    lm_s_score, lm_s_metric_key = extract_score(student_res, task_name) if student_res else (None, None)
 
     sample_cmp = build_sample_comparison(
         teacher_samples,
         student_samples,
         limit=int(args.sample_comparison_limit),
     )
+    log_state("sample_comparison_built", loaded_rows=sample_cmp.get("loaded_rows", 0))
+    # Canonical score protocol: marker-priority extraction from raw generations.
+    # Use it as the leaderboard metric only when comparison loaded the full dataset.
+    use_local_protocol = int(sample_cmp.get("loaded_rows", 0)) == int(n_rows) and int(n_rows) > 0
+    if use_local_protocol:
+        t_score = sample_cmp.get("teacher_accuracy")
+        s_score = sample_cmp.get("student_accuracy")
+        t_metric_key = "exact_match,marker-priority(local)"
+        s_metric_key = "exact_match,marker-priority(local)"
+    else:
+        t_score = None
+        s_score = None
+        t_metric_key = None
+        s_metric_key = None
+    if t_score is None:
+        t_score = lm_t_score
+        t_metric_key = lm_t_metric_key
+    if s_score is None:
+        s_score = lm_s_score
+        s_metric_key = lm_s_metric_key
+
     sample_columns_jsonl = out_dir / "sample_columns.jsonl"
     write_sample_columns_jsonl(sample_columns_jsonl, sample_cmp)
+    log_state("sample_columns_written", path=str(sample_columns_jsonl))
 
     summary = {
         "created_at_utc": utc_now(),
+        "run_id": run_id,
+        "stage": args.stage,
+        "experiment": args.experiment,
+        "parent_eval": args.parent_eval,
+        "notes": args.notes,
         "eval_name": eval_name_final,
         "task_name": task_name,
         "dataset_arrow": dataset_arrow_str,
@@ -836,6 +1234,12 @@ def main() -> None:
         "student_samples_jsonl": str(student_samples) if student_samples else None,
         "teacher_metric_key": t_metric_key,
         "student_metric_key": s_metric_key,
+        "teacher_lm_eval_exact_match": lm_t_score,
+        "student_lm_eval_exact_match": lm_s_score,
+        "teacher_lm_eval_metric_key": lm_t_metric_key,
+        "student_lm_eval_metric_key": lm_s_metric_key,
+        "scoring_protocol": "marker-priority(local): The answer is -> #### -> last number",
+        "uses_local_scoring_protocol": use_local_protocol,
         "teacher_exact_match": t_score,
         "student_exact_match": s_score,
         "delta_teacher_minus_student": (t_score - s_score) if (t_score is not None and s_score is not None) else None,
@@ -845,12 +1249,34 @@ def main() -> None:
         "sample_columns_jsonl": str(sample_columns_jsonl),
     }
     (out_dir / "comparison.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (out_dir / "eval_metadata.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "stage": args.stage,
+                "experiment": args.experiment,
+                "parent_eval": args.parent_eval,
+                "notes": args.notes,
+                "created_at_utc": summary["created_at_utc"],
+                "eval_name": eval_name_final,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    log_state("summary_written", comparison_json=str(out_dir / "comparison.json"), eval_metadata=str(out_dir / "eval_metadata.json"))
     update_leaderboard(base_root, summary)
+    update_tracking_registry(base_root, summary)
+    log_state("tracking_updated", leaderboard=str(base_root / "leaderboard.jsonl"), registry=str(base_root / "eval_tracking_registry.jsonl"))
 
     lines = [
         "# Custom lm-eval GSM8K Report",
         "",
         f"- Generated (UTC): `{summary['created_at_utc']}`",
+        f"- Run ID: `{run_id}`",
+        f"- Stage: `{args.stage}`",
+        f"- Experiment: `{args.experiment}`",
+        f"- Parent Eval: `{args.parent_eval}`",
         f"- Task: `{task_name}`",
         f"- Dataset arrow: `{dataset_arrow_str}`",
         f"- Dataset jsonl: `{data_jsonl}`",
@@ -860,6 +1286,8 @@ def main() -> None:
         "",
         f"- Teacher (`{args.teacher_model}`): `{t_score}` (metric: `{t_metric_key}`)",
         f"- Student (`{args.student_model}`): `{s_score}` (metric: `{s_metric_key}`)",
+        f"- Teacher lm-eval metric: `{lm_t_score}` (`{lm_t_metric_key}`)",
+        f"- Student lm-eval metric: `{lm_s_score}` (`{lm_s_metric_key}`)",
         f"- Delta (teacher - student): `{summary['delta_teacher_minus_student']}`",
         "",
         "## Sample Head-to-Head (first loaded rows)",
@@ -882,9 +1310,11 @@ def main() -> None:
         f"- Sample columns: `{sample_columns_jsonl}`",
     ]
     (out_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
+    log_state("report_written", report_md=str(out_dir / "report.md"))
 
     html_out: Path | None = None
     if int(args.render_html) == 1:
+        log_state("html_render_start", run_dir=str(out_dir))
         html_out = render_html_report(
             run_dir=out_dir,
             root_dir=base_root,
@@ -892,13 +1322,16 @@ def main() -> None:
             row_limit=args.html_limit,
             per_eval_sample_limit=args.html_per_eval_sample_limit,
         )
+        log_state("html_render_end", html=str(html_out) if html_out is not None else "none")
 
-    print(f"[DONE] out_dir={out_dir}")
-    print(f"[DONE] comparison={out_dir / 'comparison.json'}")
-    print(f"[DONE] report={out_dir / 'report.md'}")
+    LOGGER.info("DONE out_dir=%s", out_dir)
+    LOGGER.info("DONE comparison=%s", out_dir / "comparison.json")
+    LOGGER.info("DONE report=%s", out_dir / "report.md")
     if html_out is not None:
-        print(f"[DONE] html={html_out}")
-    print(f"[DONE] leaderboard={base_root / 'leaderboard.md'}")
+        LOGGER.info("DONE html=%s", html_out)
+    LOGGER.info("DONE leaderboard=%s", base_root / "leaderboard.md")
+    LOGGER.info("DONE tracking_registry=%s", base_root / "eval_tracking_registry.jsonl")
+    log_state("eval_run_end", eval_name=eval_name_final, out_dir=str(out_dir))
 
 
 if __name__ == "__main__":
