@@ -1,1 +1,1 @@
-teacher-sft-c2_top1_e2.0_lr3.75e-05_r16_s2048-v1
+teacher-sft-c1_seed_e1.5_lr7.50e-05_s2048_r16_a16_d0.00-qwen-template-fix-v1
