@@ -29,10 +29,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-jsonl", type=str, required=True)
     p.add_argument(
         "--mode",
-        choices=["distill_high_conf", "hard_failures", "all_gold"],
+        choices=["distill_high_conf", "distill_strict", "hard_failures", "all_gold"],
         default="distill_high_conf",
     )
     p.add_argument("--max-rows", type=int, default=0, help="<=0 means all rows.")
+    p.add_argument("--max-answer-chars", type=int, default=1200)
     return p.parse_args()
 
 
@@ -82,13 +83,23 @@ def include_row(row: dict[str, Any], mode: str) -> bool:
     t_ok = bool(row.get("teacher_ok", False))
     if mode == "distill_high_conf":
         return t_ok
+    if mode == "distill_strict":
+        if not t_ok:
+            return False
+        teacher_num = extract_priority_answer(str(row.get("teacher_raw", "")) or str(row.get("teacher_pred", "")))
+        gold_num = extract_priority_answer(str(row.get("gold", "")))
+        if not teacher_num or not gold_num:
+            return False
+        if teacher_num != gold_num:
+            return False
+        return True
     if mode == "hard_failures":
         return not t_ok
     return True
 
 
 def render_answer(row: dict[str, Any], mode: str) -> str:
-    if mode == "distill_high_conf":
+    if mode in {"distill_high_conf", "distill_strict"}:
         return normalize_teacher_answer(
             str(row.get("teacher_raw", "")),
             str(row.get("teacher_pred", "")),
@@ -111,6 +122,8 @@ def main() -> None:
                 continue
             question = str(row.get("question", "")).strip()
             answer = render_answer(row, args.mode).strip()
+            if args.max_answer_chars > 0 and len(answer) > args.max_answer_chars:
+                continue
             if not question or not answer:
                 continue
             out = {

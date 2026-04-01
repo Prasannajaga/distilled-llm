@@ -41,6 +41,9 @@ class Candidate:
     epochs: float
     learning_rate: float
     max_seq_length: int
+    lora_r: int | None = None
+    lora_alpha: int | None = None
+    lora_dropout: float | None = None
     train_jsonl: str | None = None
 
 
@@ -53,6 +56,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--student-model", type=str, default=DEFAULT_STUDENT_MODEL)
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--batch-size", type=str, default="1")
+    p.add_argument("--train-batch-size", type=int, default=1)
+    p.add_argument("--train-grad-accum", type=int, default=16)
+    p.add_argument("--oom-retries", type=int, default=2)
+    p.add_argument("--min-train-seq-length", type=int, default=512)
+    p.add_argument("--load-in-4bit", type=int, choices=[0, 1], default=1)
+    p.add_argument("--lora-r", type=int, default=16)
+    p.add_argument("--lora-alpha", type=int, default=16)
+    p.add_argument("--lora-dropout", type=float, default=0.0)
+    p.add_argument("--seed-learning-rate", type=float, default=7.5e-5)
+    p.add_argument("--seed-epochs", type=float, default=1.5)
+    p.add_argument("--seed-max-seq-length", type=int, default=2048)
+    p.add_argument("--max-candidates-per-cycle", type=int, default=8)
     p.add_argument("--num-fewshot", type=int, default=8)
     p.add_argument("--gen-max-toks", type=int, default=256)
     p.add_argument("--limit", type=str, default=None)
@@ -219,38 +234,92 @@ def diff_counts(baseline_cmp: Path, candidate_cmp: Path) -> tuple[int, int]:
     return improved, regressed
 
 
-def coarse_candidates() -> list[Candidate]:
-    return [
-        Candidate(cycle=1, name="c1_e1.0_lr1e-4_s2048", epochs=1.0, learning_rate=1e-4, max_seq_length=2048),
-        Candidate(cycle=1, name="c1_e2.0_lr5e-5_s2048", epochs=2.0, learning_rate=5e-5, max_seq_length=2048),
-        Candidate(cycle=1, name="c1_e1.5_lr7.5e-5_s2048", epochs=1.5, learning_rate=7.5e-5, max_seq_length=2048),
-        Candidate(cycle=1, name="c1_e1.5_lr1e-4_s3072", epochs=1.5, learning_rate=1e-4, max_seq_length=3072),
-    ]
-
-
-def fine_candidates(cycle: int, top_two: list[dict[str, Any]]) -> list[Candidate]:
+def _dedupe_candidates(cands: list[Candidate]) -> list[Candidate]:
     out: list[Candidate] = []
     seen: set[str] = set()
-    for rank, t in enumerate(top_two, start=1):
-        base = t["config"]
-        for lr_mult in (0.75, 1.0):
-            for ep_mult in (0.75, 1.0):
-                epochs = max(0.5, round(float(base["epochs"]) * ep_mult, 2))
-                lr = float(base["learning_rate"]) * lr_mult
-                name = f"c{cycle}_top{rank}_e{epochs}_lr{lr:.2e}_s{int(base['max_seq_length'])}"
-                if name in seen:
-                    continue
-                seen.add(name)
-                out.append(
-                    Candidate(
-                        cycle=cycle,
-                        name=name,
-                        epochs=epochs,
-                        learning_rate=lr,
-                        max_seq_length=int(base["max_seq_length"]),
-                    )
-                )
+    for c in cands:
+        if c.name in seen:
+            continue
+        seen.add(c.name)
+        out.append(c)
     return out
+
+
+def _build_candidates_from_seed(
+    cycle: int,
+    prefix: str,
+    seed: dict[str, Any],
+    max_candidates: int,
+) -> list[Candidate]:
+    base_epochs = max(0.5, float(seed["epochs"]))
+    base_lr = max(1e-7, float(seed["learning_rate"]))
+    base_seq = max(256, int(seed["max_seq_length"]))
+    base_r = max(8, int(seed["lora_r"]))
+    base_alpha = max(1, int(seed["lora_alpha"]))
+    base_dropout = float(seed["lora_dropout"])
+    ratio = max(0.25, min(4.0, float(base_alpha) / float(base_r)))
+
+    lr_mults = (0.8, 0.9, 1.0, 1.1)
+    ep_mults = (0.8, 1.0, 1.2)
+    r_vals = sorted({max(8, base_r // 2), base_r, min(64, base_r * 2)})
+    alpha_mults = (1.0, 1.5)
+    dropout_vals = sorted({max(0.0, min(0.2, base_dropout)), 0.05})
+
+    scored: list[tuple[float, Candidate]] = []
+    for lr_mult in lr_mults:
+        for ep_mult in ep_mults:
+            for r in r_vals:
+                for alpha_mult in alpha_mults:
+                    alpha = max(1, int(round(r * ratio * alpha_mult)))
+                    for drop in dropout_vals:
+                        epochs = round(base_epochs * ep_mult, 2)
+                        lr = base_lr * lr_mult
+                        name = (
+                            f"{prefix}_e{epochs}_lr{lr:.2e}_s{base_seq}"
+                            f"_r{r}_a{alpha}_d{drop:.2f}"
+                        )
+                        score = (
+                            abs(lr_mult - 1.0)
+                            + abs(ep_mult - 1.0)
+                            + abs((r / base_r) - 1.0)
+                            + abs(alpha_mult - 1.0)
+                            + abs(drop - base_dropout) * 2.0
+                        )
+                        scored.append(
+                            (
+                                score,
+                                Candidate(
+                                    cycle=cycle,
+                                    name=name,
+                                    epochs=max(0.5, epochs),
+                                    learning_rate=max(1e-7, lr),
+                                    max_seq_length=base_seq,
+                                    lora_r=r,
+                                    lora_alpha=alpha,
+                                    lora_dropout=drop,
+                                ),
+                            )
+                        )
+
+    scored.sort(key=lambda x: (x[0], x[1].name))
+    ordered = [cand for _, cand in scored]
+    deduped = _dedupe_candidates(ordered)
+    return deduped[: max(1, max_candidates)]
+
+
+def cycle_candidates_from_previous(
+    cycle: int,
+    seeds: list[dict[str, Any]],
+    max_candidates: int,
+) -> list[Candidate]:
+    if not seeds:
+        return []
+    per_seed = max(2, max_candidates // len(seeds))
+    out: list[Candidate] = []
+    for rank, seed in enumerate(seeds, start=1):
+        prefix = f"c{cycle}_top{rank}"
+        out.extend(_build_candidates_from_seed(cycle, prefix, seed, per_seed))
+    return _dedupe_candidates(out)[: max(1, max_candidates)]
 
 
 def refinement_candidate(cycle: int, best: dict[str, Any], hard_jsonl: Path) -> Candidate:
@@ -261,6 +330,9 @@ def refinement_candidate(cycle: int, best: dict[str, Any], hard_jsonl: Path) -> 
         epochs=1.0,
         learning_rate=float(cfg["learning_rate"]) * 0.5,
         max_seq_length=int(cfg["max_seq_length"]),
+        lora_r=int(cfg.get("lora_r", 16)),
+        lora_alpha=int(cfg.get("lora_alpha", 16)),
+        lora_dropout=float(cfg.get("lora_dropout", 0.0)),
         train_jsonl=str(hard_jsonl),
     )
 
@@ -271,9 +343,10 @@ def run_candidate(
     run_id: str,
     parent_eval: str,
     stage: str,
+    baseline_cmp: Path | None = None,
 ) -> dict[str, Any]:
     run_root = Path(args.work_root) / cand.name
-    train_dir = run_root / "full_sft"
+    train_dir = run_root / "lora"
     merged_dir = run_root / "merged"
     LOGGER.info(
         "Running candidate train | cycle=%d name=%s epochs=%s lr=%s seq=%s",
@@ -290,36 +363,106 @@ def run_candidate(
         cand.cycle,
         cand.name,
     )
-    train_cmd = [
-        "uv",
-        "run",
-        "python",
-        "newScripts/train_teacher_full_sft_gsm8k.py",
-        "--base-model",
-        args.base_model,
-        "--dataset-path",
-        args.dataset_path,
-        "--split",
-        "train",
-        "--epochs",
-        str(cand.epochs),
-        "--learning-rate",
-        str(cand.learning_rate),
-        "--max-seq-length",
-        str(cand.max_seq_length),
-        "--answer-style",
-        "cot_final_marker",
-        "--output-dir",
-        str(train_dir),
-        "--merged-output-dir",
-        str(merged_dir),
-        "--merge-16bit",
-        "1",
-    ]
-    if cand.train_jsonl:
-        train_cmd.extend(["--train-jsonl", cand.train_jsonl])
-        train_cmd.extend(["--eval-jsonl", cand.train_jsonl])
-    run_cmd(train_cmd, args.dry_run, retries=1)
+    base_effective_batch = max(1, int(args.train_batch_size) * int(args.train_grad_accum))
+    attempt_cfgs: list[tuple[int, int, int]] = []
+    train_bs = max(1, int(args.train_batch_size))
+    train_seq = max(1, int(cand.max_seq_length))
+    min_seq = max(128, int(args.min_train_seq_length))
+    for _ in range(max(1, int(args.oom_retries) + 1)):
+        train_ga = max(1, (base_effective_batch + train_bs - 1) // train_bs)
+        cfg = (train_bs, train_ga, train_seq)
+        if cfg not in attempt_cfgs:
+            attempt_cfgs.append(cfg)
+        next_bs = max(1, train_bs // 2)
+        next_seq = train_seq
+        if next_bs == train_bs:
+            next_seq = max(min_seq, train_seq // 2)
+        if next_bs == train_bs and next_seq == train_seq:
+            break
+        train_bs, train_seq = next_bs, next_seq
+
+    used_train_bs = int(args.train_batch_size)
+    used_train_ga = int(args.train_grad_accum)
+    used_train_seq = int(cand.max_seq_length)
+    used_lora_r = int(cand.lora_r if cand.lora_r is not None else args.lora_r)
+    used_lora_alpha = int(cand.lora_alpha if cand.lora_alpha is not None else args.lora_alpha)
+    used_lora_dropout = float(cand.lora_dropout if cand.lora_dropout is not None else args.lora_dropout)
+    last_train_err: subprocess.CalledProcessError | None = None
+    for i, (train_bs, train_ga, train_seq) in enumerate(attempt_cfgs, start=1):
+        train_lora_r = int(cand.lora_r if cand.lora_r is not None else args.lora_r)
+        train_lora_alpha = int(cand.lora_alpha if cand.lora_alpha is not None else args.lora_alpha)
+        train_lora_dropout = float(cand.lora_dropout if cand.lora_dropout is not None else args.lora_dropout)
+        train_cmd = [
+            "uv",
+            "run",
+            "python",
+            "newScripts/train_teacher_unsloth_gsm8k.py",
+            "--base-model",
+            args.base_model,
+            "--dataset-path",
+            args.dataset_path,
+            "--split",
+            "train",
+            "--epochs",
+            str(cand.epochs),
+            "--learning-rate",
+            str(cand.learning_rate),
+            "--max-seq-length",
+            str(train_seq),
+            "--load-in-4bit",
+            str(args.load_in_4bit),
+            "--lora-r",
+            str(train_lora_r),
+            "--lora-alpha",
+            str(train_lora_alpha),
+            "--lora-dropout",
+            str(train_lora_dropout),
+            "--batch-size",
+            str(train_bs),
+            "--grad-accum",
+            str(train_ga),
+            "--answer-style",
+            "cot_final_marker",
+            "--output-dir",
+            str(train_dir),
+            "--merged-output-dir",
+            str(merged_dir),
+            "--merge-16bit",
+            "1",
+        ]
+        if cand.train_jsonl:
+            train_cmd.extend(["--train-jsonl", cand.train_jsonl])
+            train_cmd.extend(["--eval-jsonl", cand.train_jsonl])
+        LOGGER.info(
+            "SFT attempt %d/%d | train_bs=%d grad_accum=%d seq=%d",
+            i,
+            len(attempt_cfgs),
+            train_bs,
+            train_ga,
+            train_seq,
+        )
+        try:
+            run_cmd(train_cmd, args.dry_run, retries=1 if i == 1 else 0)
+            used_train_bs = train_bs
+            used_train_ga = train_ga
+            used_train_seq = train_seq
+            used_lora_r = train_lora_r
+            used_lora_alpha = train_lora_alpha
+            used_lora_dropout = train_lora_dropout
+            last_train_err = None
+            break
+        except subprocess.CalledProcessError as exc:
+            last_train_err = exc
+            if i < len(attempt_cfgs):
+                LOGGER.warning(
+                    "SFT attempt failed; retrying with lower memory config (next attempt %d/%d).",
+                    i + 1,
+                    len(attempt_cfgs),
+                )
+            else:
+                LOGGER.error("All SFT attempts failed for candidate=%s", cand.name)
+    if last_train_err is not None:
+        raise last_train_err
     sft_elapsed = time.perf_counter() - sft_started
     log_state(
         "sft_end",
@@ -383,6 +526,8 @@ def run_candidate(
         parent_eval,
         "--overwrite-output",
     ]
+    if baseline_cmp is not None and baseline_cmp.exists():
+        eval_cmd.extend(["--reuse-student-comparison-json", str(baseline_cmp)])
     if args.limit:
         eval_cmd.extend(["--limit", str(args.limit)])
     run_cmd(eval_cmd, args.dry_run, retries=1)
@@ -412,8 +557,15 @@ def run_candidate(
             "epochs": cand.epochs,
             "learning_rate": cand.learning_rate,
             "max_seq_length": cand.max_seq_length,
+            "actual_train_batch_size": used_train_bs,
+            "actual_train_grad_accum": used_train_ga,
+            "actual_train_max_seq_length": used_train_seq,
+            "load_in_4bit": int(args.load_in_4bit),
+            "lora_r": used_lora_r,
+            "lora_alpha": used_lora_alpha,
+            "lora_dropout": used_lora_dropout,
             "train_jsonl": cand.train_jsonl,
-            "train_mode": "full_sft",
+            "train_mode": "lora_unsloth",
         },
         "train_dir": str(train_dir),
         "lora_dir": str(train_dir),  # legacy key retained for compatibility
@@ -423,7 +575,7 @@ def run_candidate(
         "teacher_exact_match": em,
     }
 
-
+SKIP_BASELINE = True
 def main() -> None:
     args = parse_args()
     configure_logging()
@@ -445,7 +597,7 @@ def main() -> None:
         else:
             auto = _latest_baseline_for_experiment(args.experiment_name)
             baseline_cmp = auto if auto is not None else explicit
-    if not baseline_cmp.exists():
+    if not baseline_cmp.exists() and not SKIP_BASELINE:
         raise FileNotFoundError(
             "Baseline comparison.json not found. Run before-distill first.\n"
             "Suggested command:\n"
@@ -471,9 +623,54 @@ def main() -> None:
         log_state("cycle_start", cycle=cycle, max_cycles=args.max_cycles)
         LOGGER.info("Cycle %d/%d", cycle, args.max_cycles)
         if cycle == 1:
-            candidates = coarse_candidates()
+            seed = {
+                "epochs": float(args.seed_epochs),
+                "learning_rate": float(args.seed_learning_rate),
+                "max_seq_length": int(args.seed_max_seq_length),
+                "lora_r": int(args.lora_r),
+                "lora_alpha": int(args.lora_alpha),
+                "lora_dropout": float(args.lora_dropout),
+            }
+            candidates = _build_candidates_from_seed(
+                cycle=cycle,
+                prefix=f"c{cycle}_seed",
+                seed=seed,
+                max_candidates=int(args.max_candidates_per_cycle),
+            )
         elif cycle == 2:
-            candidates = fine_candidates(cycle, prev_cycle_top2 if prev_cycle_top2 else results[:2])
+            seeds: list[dict[str, Any]] = []
+            for rec in (prev_cycle_top2 if prev_cycle_top2 else results[:2]):
+                cfg = rec.get("config", {})
+                seeds.append(
+                    {
+                        "epochs": float(cfg.get("epochs", args.seed_epochs)),
+                        "learning_rate": float(cfg.get("learning_rate", args.seed_learning_rate)),
+                        "max_seq_length": int(cfg.get("actual_train_max_seq_length", cfg.get("max_seq_length", args.seed_max_seq_length))),
+                        "lora_r": int(cfg.get("lora_r", args.lora_r)),
+                        "lora_alpha": int(cfg.get("lora_alpha", args.lora_alpha)),
+                        "lora_dropout": float(cfg.get("lora_dropout", args.lora_dropout)),
+                    }
+                )
+            candidates = cycle_candidates_from_previous(
+                cycle=cycle,
+                seeds=seeds,
+                max_candidates=int(args.max_candidates_per_cycle),
+            )
+            if not candidates:
+                fallback_seed = {
+                    "epochs": float(args.seed_epochs),
+                    "learning_rate": float(args.seed_learning_rate),
+                    "max_seq_length": int(args.seed_max_seq_length),
+                    "lora_r": int(args.lora_r),
+                    "lora_alpha": int(args.lora_alpha),
+                    "lora_dropout": float(args.lora_dropout),
+                }
+                candidates = _build_candidates_from_seed(
+                    cycle=cycle,
+                    prefix=f"c{cycle}_seed",
+                    seed=fallback_seed,
+                    max_candidates=int(args.max_candidates_per_cycle),
+                )
         else:
             if best is None:
                 log_state("cycle_skip_no_best", cycle=cycle)
@@ -506,7 +703,14 @@ def main() -> None:
         for cand in candidates:
             parent_eval = str(best["eval_name"]) if best is not None else baseline_eval
             stage = "teacher-refine" if cycle >= 3 else "teacher-sft"
-            rec = run_candidate(args, cand, run_id=run_id, parent_eval=parent_eval, stage=stage)
+            rec = run_candidate(
+                args,
+                cand,
+                run_id=run_id,
+                parent_eval=parent_eval,
+                stage=stage,
+                baseline_cmp=baseline_cmp if baseline_cmp.exists() else None,
+            )
             cycle_runs.append(rec)
             results.append(rec)
             LOGGER.info(

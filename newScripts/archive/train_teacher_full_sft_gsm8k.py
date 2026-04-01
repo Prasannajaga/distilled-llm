@@ -5,14 +5,16 @@ import argparse
 import logging
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
+import torch
 from datasets import Dataset, load_dataset
 
 DEFAULT_BASE_MODEL = "/media/prasanna/716F26140AED9B67/models/models--Qwen--Qwen2-Math-1.5B-Instruct"
 DEFAULT_DATASET_PATH = "/media/prasanna/716F26140AED9B67/datasets/GSM8K"
-LOGGER = logging.getLogger("train_teacher_unsloth")
+LOGGER = logging.getLogger("train_teacher_full_sft")
 
 
 SYSTEM_PROMPT = (
@@ -32,7 +34,7 @@ def configure_logging() -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fine-tune teacher model on GSM8K using Unsloth LoRA")
+    p = argparse.ArgumentParser(description="Full SFT teacher fine-tune on GSM8K (no LoRA)")
     p.add_argument("--base-model", type=str, default=DEFAULT_BASE_MODEL)
     p.add_argument("--dataset-path", type=str, default=DEFAULT_DATASET_PATH)
     p.add_argument("--split", choices=["train", "test"], default="train")
@@ -40,38 +42,33 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-eval-samples", type=int, default=256)
     p.add_argument("--train-jsonl", type=str, default=None, help="Optional JSONL with question/answer for training.")
     p.add_argument("--eval-jsonl", type=str, default=None, help="Optional JSONL with question/answer for eval.")
-    p.add_argument("--output-dir", type=str, default="newoutput/teacher-gsm8k-unsloth-lora")
-    p.add_argument("--merged-output-dir", type=str, default="newoutput/teacher-gsm8k-unsloth-merged")
+    p.add_argument("--output-dir", type=str, default="output/teacher-gsm8k-full-sft")
+    p.add_argument("--merged-output-dir", type=str, default="output/teacher-gsm8k-full-sft")
 
     p.add_argument("--max-seq-length", type=int, default=2048)
-    p.add_argument("--load-in-4bit", type=int, choices=[0, 1], default=1)
-
-    p.add_argument("--lora-r", type=int, default=16)
-    p.add_argument("--lora-alpha", type=int, default=16)
-    p.add_argument("--lora-dropout", type=float, default=0.0)
-
-    p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--eval-batch-size", type=int, default=1)
+    p.add_argument("--grad-accum", type=int, default=16)
     p.add_argument("--epochs", type=float, default=2.0)
-    p.add_argument("--learning-rate", type=float, default=2e-4)
+    p.add_argument("--learning-rate", type=float, default=5e-5)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--logging-steps", type=int, default=10)
-    p.add_argument("--save-steps", type=int, default=1000)
+    p.add_argument("--save-steps", type=int, default=200)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--gradient-checkpointing", type=int, choices=[0, 1], default=1)
     p.add_argument(
         "--answer-style",
         choices=["cot_final_marker", "raw"],
         default="cot_final_marker",
         help="Target style for assistant answer text.",
     )
-
     p.add_argument(
         "--merge-16bit",
         type=int,
         choices=[0, 1],
         default=1,
-        help="If 1, saves merged 16-bit model for regular HF/vLLM inference.",
+        help="Compatibility flag. For full SFT, this just ensures model files exist in merged-output-dir.",
     )
     return p.parse_args()
 
@@ -173,9 +170,9 @@ def _format_row(question: str, answer: str, answer_style: str) -> str:
     question = question.strip()
     answer = _normalize_answer(answer, answer_style)
     return (
-        f"<|system|>\\n{SYSTEM_PROMPT}\\n"
-        f"<|user|>\\n{question}\\n"
-        f"<|assistant|>\\n{answer}"
+        f"<|system|>\n{SYSTEM_PROMPT}\n"
+        f"<|user|>\n{question}\n"
+        f"<|assistant|>\n{answer}"
     )
 
 
@@ -192,8 +189,6 @@ def resolve_base_model_ref(model_ref: str) -> str:
     local_path = Path(model_ref).expanduser()
     if local_path.exists():
         p = local_path.resolve()
-        # Handle HF cache-root layout:
-        #   models--ORG--NAME/{refs,snapshots/<rev>/...}
         if p.is_dir() and (p / "snapshots").is_dir() and (p / "refs").is_dir():
             snap_root = p / "snapshots"
             chosen: Path | None = None
@@ -214,16 +209,7 @@ def resolve_base_model_ref(model_ref: str) -> str:
             if chosen is not None:
                 p = chosen
         return str(p)
-    try:
-        from huggingface_hub import snapshot_download
-
-        local_snapshot = snapshot_download(
-            repo_id=model_ref,
-            local_files_only=True,
-        )
-        return str(Path(local_snapshot).resolve())
-    except Exception:
-        return model_ref
+    return model_ref
 
 
 def main() -> None:
@@ -231,12 +217,12 @@ def main() -> None:
     args = parse_args()
 
     try:
-        from unsloth import FastLanguageModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         from trl import SFTConfig, SFTTrainer
     except Exception as exc:
         raise RuntimeError(
             "Missing training deps. Install with:\n"
-            "  uv pip install unsloth trl peft bitsandbytes huggingface_hub\n"
+            "  uv pip install transformers trl accelerate datasets huggingface_hub\n"
             f"Original import error: {exc}"
         ) from exc
 
@@ -258,82 +244,74 @@ def main() -> None:
     eval_ds = prepare_dataset(eval_raw, args.answer_style)
     LOGGER.info("DATA train=%s eval=%s", f"{len(train_ds):,}", f"{len(eval_ds):,}")
 
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=resolved_base_model,
-        max_seq_length=args.max_seq_length,
-        load_in_4bit=bool(args.load_in_4bit),
-    )
+    tokenizer = AutoTokenizer.from_pretrained(resolved_base_model, trust_remote_code=True)
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-        use_gradient_checkpointing="unsloth",
-        random_state=args.seed,
+    use_cuda = torch.cuda.is_available()
+    bf16_ok = bool(use_cuda and torch.cuda.is_bf16_supported())
+    dtype = torch.bfloat16 if bf16_ok else (torch.float16 if use_cuda else torch.float32)
+    LOGGER.info("CFG torch_dtype=%s bf16=%s", dtype, bf16_ok)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        resolved_base_model,
+        trust_remote_code=True,
+        torch_dtype=dtype,
     )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    bf16_ok = os.environ.get("UNSLOTH_FORCE_FP16", "0") != "1"
     sft_config = SFTConfig(
         output_dir=str(out_dir),
         dataset_text_field="text",
+        max_length=args.max_seq_length,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio,
         weight_decay=args.weight_decay,
         lr_scheduler_type="cosine",
-        optim="adamw_8bit",
+        optim="adamw_torch",
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
+        eval_steps=max(args.logging_steps, 50),
+        eval_strategy="steps",
         bf16=bf16_ok,
-        fp16=not bf16_ok,
+        fp16=(use_cuda and not bf16_ok),
+        gradient_checkpointing=bool(args.gradient_checkpointing),
         seed=args.seed,
         report_to="none",
     )
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         args=sft_config,
     )
 
-    LOGGER.info("TRAIN starting Unsloth LoRA fine-tune...")
+    LOGGER.info("TRAIN starting full SFT fine-tune...")
     trainer.train()
 
-    LOGGER.info("SAVE LoRA adapters to %s", out_dir)
-    model.save_pretrained(str(out_dir))
+    LOGGER.info("SAVE full model to %s", out_dir)
+    trainer.save_model(str(out_dir))
     tokenizer.save_pretrained(str(out_dir))
 
     if args.merge_16bit:
         merged_dir = Path(args.merged_output_dir)
         merged_dir.mkdir(parents=True, exist_ok=True)
-        LOGGER.info("SAVE merged 16-bit model to %s", merged_dir)
-        model.save_pretrained_merged(str(merged_dir), tokenizer, save_method="merged_16bit")
-        merged_files = list(merged_dir.glob("*"))
-        if not merged_files:
-            raise RuntimeError(
-                "Merged model export produced no files. "
-                "This usually happens when the base model cannot be resolved locally. "
-                "Try passing a local model path with --base-model."
-            )
+        if out_dir.resolve() != merged_dir.resolve():
+            LOGGER.info("SAVE copying full model to merged dir %s", merged_dir)
+            shutil.copytree(out_dir, merged_dir, dirs_exist_ok=True)
+        else:
+            LOGGER.info("SAVE merged dir is output dir: %s", merged_dir)
 
-    LOGGER.info("DONE teacher fine-tune complete.")
+    LOGGER.info("DONE teacher full SFT complete.")
 
 
 if __name__ == "__main__":

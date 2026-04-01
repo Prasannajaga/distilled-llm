@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
+import random
 import sys
 from pathlib import Path
 
@@ -35,6 +37,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-jsonl", type=str, default=None, help="Optional eval JSONL with question/answer fields.")
     p.add_argument("--max-train-samples", type=int, default=0)
     p.add_argument("--max-eval-samples", type=int, default=512)
+    p.add_argument(
+        "--val-split-ratio",
+        type=float,
+        default=0.0,
+        help="If >0 and --eval-jsonl is not provided, carve eval split from train JSONL.",
+    )
+    p.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+        help="Seed used when creating deterministic train/eval split from train JSONL.",
+    )
     p.add_argument("--output-dir", type=str, default="output/student-gsm8k-distill-lora")
     p.add_argument("--merged-output-dir", type=str, default="output/student-gsm8k-distill-merged")
 
@@ -68,21 +82,68 @@ def load_jsonl_dataset(path: str) -> Dataset:
     return ds
 
 
-def _format_row(question: str, answer: str) -> str:
+def _legacy_chat_text(question: str, answer: str) -> str:
     return (
         f"<|system|>\\n{SYSTEM_PROMPT}\\n"
-        f"<|user|>\\n{question.strip()}\\n"
-        f"<|assistant|>\\n{answer.strip()}"
+        f"<|user|>\\n{question}\\n"
+        f"<|assistant|>\\n{answer}"
     )
 
 
-def prepare_dataset(ds: Dataset) -> Dataset:
+def _chat_template_signature(tokenizer: object) -> str:
+    tmpl = getattr(tokenizer, "chat_template", None)
+    if isinstance(tmpl, str) and tmpl.strip():
+        return hashlib.sha1(tmpl.encode("utf-8")).hexdigest()[:12]
+    return "no-template"
+
+
+def _format_row(question: str, answer: str, tokenizer: object) -> str:
+    q = question.strip()
+    a = answer.strip()
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": q},
+        {"role": "assistant", "content": a},
+    ]
+    apply_fn = getattr(tokenizer, "apply_chat_template", None)
+    if callable(apply_fn):
+        try:
+            rendered = apply_fn(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            if isinstance(rendered, str) and rendered.strip():
+                return rendered
+        except Exception as exc:
+            LOGGER.warning("CHAT template apply failed, using legacy fallback: %s", exc)
+    return _legacy_chat_text(q, a)
+
+
+def prepare_dataset(ds: Dataset, tokenizer: object) -> Dataset:
     def _mapper(row: dict) -> dict:
         q = str(row.get("question", "")).strip()
         a = str(row.get("answer", "")).strip()
-        return {"text": _format_row(q, a)}
+        return {"text": _format_row(q, a, tokenizer)}
 
     return ds.map(_mapper, remove_columns=ds.column_names)
+
+
+def split_train_eval_dataset(ds: Dataset, val_split_ratio: float, seed: int) -> tuple[Dataset, Dataset]:
+    if len(ds) < 2:
+        raise ValueError("Need at least 2 rows to build train/eval split.")
+    ratio = float(val_split_ratio)
+    if ratio <= 0.0 or ratio >= 1.0:
+        raise ValueError("--val-split-ratio must be in (0, 1).")
+    total = len(ds)
+    eval_size = int(round(total * ratio))
+    eval_size = max(1, min(total - 1, eval_size))
+    indices = list(range(total))
+    rnd = random.Random(int(seed))
+    rnd.shuffle(indices)
+    eval_idx = sorted(indices[:eval_size])
+    train_idx = sorted(indices[eval_size:])
+    return ds.select(train_idx), ds.select(eval_idx)
 
 
 def resolve_base_model_ref(model_ref: str) -> str:
@@ -142,20 +203,30 @@ def main() -> None:
     train_raw = load_jsonl_dataset(args.train_jsonl)
     if args.max_train_samples > 0:
         train_raw = train_raw.select(range(min(args.max_train_samples, len(train_raw))))
-
-    eval_raw = load_jsonl_dataset(args.eval_jsonl) if args.eval_jsonl else train_raw
+    if args.eval_jsonl:
+        eval_raw = load_jsonl_dataset(args.eval_jsonl)
+    elif float(args.val_split_ratio) > 0.0:
+        train_raw, eval_raw = split_train_eval_dataset(
+            train_raw,
+            val_split_ratio=float(args.val_split_ratio),
+            seed=int(args.split_seed),
+        )
+    else:
+        eval_raw = train_raw
     if args.max_eval_samples > 0:
         eval_raw = eval_raw.select(range(min(args.max_eval_samples, len(eval_raw))))
-
-    train_ds = prepare_dataset(train_raw)
-    eval_ds = prepare_dataset(eval_raw)
-    LOGGER.info("DATA train=%s eval=%s", f"{len(train_ds):,}", f"{len(eval_ds):,}")
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=resolved_base_model,
         max_seq_length=args.max_seq_length,
         load_in_4bit=bool(args.load_in_4bit),
     )
+    chat_template_sig = _chat_template_signature(tokenizer)
+    LOGGER.info("CFG chat_template_sig=%s", chat_template_sig)
+
+    train_ds = prepare_dataset(train_raw, tokenizer)
+    eval_ds = prepare_dataset(eval_raw, tokenizer)
+    LOGGER.info("DATA train=%s eval=%s", f"{len(train_ds):,}", f"{len(eval_ds):,}")
 
     model = FastLanguageModel.get_peft_model(
         model,

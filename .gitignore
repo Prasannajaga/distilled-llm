@@ -8,6 +8,39 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
+env/
+
+# Large artifacts (training/eval outputs, datasets, model weights)
+newoutput/
+output/
+Cdatasets/
+datasets/
+unsloth_compiled_cache/
+
+# HF / model caches
+.cache/
+cache/
+huggingface/
+
+# Logs and run dumps
+*.log
+*.out
+*.err
+wandb/
+
+# Large model/checkpoint files
+*.safetensors
+*.bin
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.gguf
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
 output/*.pt
 dist/ 
 test.py
@@ -26,7 +59,6 @@ output/mini-math-teacher-v1-30K/checkpoints_model_30000.safetensors
 output/mini-math-teacher-v1-30K/model.safetensors
 projects.txt
 scripts/eval_compare_models.py
-unsloth_compiled_cache/
 *.safetensors
 *.pth
 output/teacher-gsm8k-unsloth-lora/

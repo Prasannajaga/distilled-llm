@@ -55,6 +55,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split", choices=["train", "test"], default="test")
     p.add_argument("--max-samples", type=int, default=0)
     p.add_argument("--student-model", type=str, default=DEFAULT_STUDENT_MODEL)
+    p.add_argument(
+        "--reuse-student-comparison-json",
+        type=str,
+        default=None,
+        help="Optional path to an existing comparison.json to reuse student artifacts/scores without re-running student lm-eval.",
+    )
+    p.add_argument(
+        "--resume-student-only",
+        action="store_true",
+        help="Skip teacher lm-eval and run only student lm-eval in an existing eval folder.",
+    )
+    p.add_argument(
+        "--reuse-teacher-comparison-json",
+        type=str,
+        default=None,
+        help="Optional path to an existing comparison.json to reuse teacher artifacts/scores without re-running teacher lm-eval.",
+    )
     p.add_argument("--teacher-model", type=str, default=DEFAULT_TEACHER_MODEL)
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--batch-size", type=str, default="1")
@@ -167,6 +184,11 @@ def parse_args() -> argparse.Namespace:
         help="Max loaded rows per eval for all-evals sample explorer in report.html (<=0 means all).",
     )
     p.add_argument("--html-title", type=str, default="lm-eval Dashboard", help="HTML report title")
+    p.add_argument(
+        "--fast-mode",
+        action="store_true",
+        help="Speed-oriented mode: disables HTML rendering. Does not change generation/scoring settings.",
+    )
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args()
 
@@ -349,6 +371,8 @@ def run_cmd(cmd: list[str], cwd: Path, retries: int = 0, env: dict[str, str] | N
     for attempt in range(retries + 1):
         start = time.perf_counter()
         tail: list[str] = []
+        output_total = 0
+        last_output_at = start
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -361,10 +385,13 @@ def run_cmd(cmd: list[str], cwd: Path, retries: int = 0, env: dict[str, str] | N
             )
             assert proc.stdout is not None
             def _reader() -> None:
+                nonlocal output_total, last_output_at
                 assert proc.stdout is not None
                 for line in proc.stdout:
                     msg = line.rstrip("\n")
                     tail.append(msg)
+                    output_total += 1
+                    last_output_at = time.perf_counter()
                     if len(tail) > COMMAND_TAIL_LINES:
                         del tail[:-COMMAND_TAIL_LINES]
                     if ECHO_SUBPROCESS:
@@ -374,9 +401,16 @@ def run_cmd(cmd: list[str], cwd: Path, retries: int = 0, env: dict[str, str] | N
             t.start()
             while proc.poll() is None:
                 time.sleep(HEARTBEAT_SECONDS)
-                elapsed = time.perf_counter() - start
-                last_line = tail[-1] if tail else "(no output yet)"
-                LOGGER.info("Still running (%.1fs): %s", elapsed, last_line[:200])
+                now = time.perf_counter()
+                elapsed = now - start
+                idle = now - last_output_at
+                LOGGER.info(
+                    "Still running (%.1fs): output_lines_total=%d tail_lines=%d last_output=%.1fs_ago",
+                    elapsed,
+                    output_total,
+                    len(tail),
+                    idle,
+                )
             t.join(timeout=5)
             rc = proc.wait()
             if rc != 0:
@@ -776,6 +810,29 @@ def extract_score(result_json: Path, task_name: str) -> tuple[float | None, str 
     return fallback_val, fallback_key
 
 
+def _load_reuse_summary(path_arg: str | None, role: str) -> dict[str, Any] | None:
+    if not path_arg:
+        return None
+    p = Path(path_arg)
+    if not p.exists():
+        raise FileNotFoundError(f"reuse-{role} comparison.json not found: {p}")
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Invalid reuse-{role} comparison payload (expected JSON object): {p}")
+    return payload
+
+
+def _path_from_summary(summary: dict[str, Any], key: str, role: str) -> Path | None:
+    raw = summary.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    p = Path(raw)
+    if p.exists():
+        return p
+    LOGGER.warning("Reuse-%s path missing for key=%s: %s", role, key, p)
+    return None
+
+
 def update_leaderboard(root_dir: Path, summary: dict[str, Any]) -> None:
     root_dir.mkdir(parents=True, exist_ok=True)
     lb_jsonl = root_dir / "leaderboard.jsonl"
@@ -895,6 +952,10 @@ def resolve_model_ref(model_ref: str, local_only: bool) -> tuple[str, bool]:
                 )
 
         return str(p), True
+    if local_only:
+        raise FileNotFoundError(
+            f"--local-models-only was set, but local model path was not found: {p}"
+        )
     inferred_repo = infer_hf_repo_id(model_ref)
     if inferred_repo:
         LOGGER.info(
@@ -903,11 +964,6 @@ def resolve_model_ref(model_ref: str, local_only: bool) -> tuple[str, bool]:
             inferred_repo,
         )
         return inferred_repo, False
-    if local_only:
-        LOGGER.warning(
-            "--local-models-only was set, but local model path was not found: %s. Falling back to remote model resolution.",
-            model_ref,
-        )
     return model_ref, False
 
 
@@ -956,6 +1012,18 @@ def render_html_report(
 def main() -> None:
     configure_logging()
     args = parse_args()
+    if args.resume_student_only and args.overwrite_output:
+        raise ValueError("--resume-student-only cannot be combined with --overwrite-output.")
+    if args.resume_student_only and args.reuse_student_comparison_json:
+        raise ValueError("--resume-student-only cannot be combined with --reuse-student-comparison-json.")
+    if args.resume_student_only and args.reuse_teacher_comparison_json:
+        raise ValueError("--resume-student-only cannot be combined with --reuse-teacher-comparison-json.")
+    if args.fast_mode:
+        if int(args.render_html) != 0:
+            LOGGER.info("Fast mode enabled: forcing --render-html=0")
+        args.render_html = 0
+    reused_teacher_summary = _load_reuse_summary(args.reuse_teacher_comparison_json, "teacher")
+    reused_student_summary = _load_reuse_summary(args.reuse_student_comparison_json, "student")
     log_state("eval_run_start", stage=args.stage, experiment=args.experiment, split=args.split)
     ensure_lm_eval_installed()
     base_root = Path("newoutput") / "lm_eval"
@@ -1015,8 +1083,16 @@ def main() -> None:
     )
     log_state("task_yaml_written", task_name=task_name, task_yaml=str(task_yaml))
 
-    teacher_ref, teacher_is_local = resolve_model_ref(args.teacher_model, args.local_models_only)
-    student_ref, student_is_local = resolve_model_ref(args.student_model, args.local_models_only)
+    if reused_teacher_summary is not None:
+        teacher_ref = str(reused_teacher_summary.get("teacher_model") or args.teacher_model)
+        teacher_is_local = bool(reused_teacher_summary.get("teacher_model_is_local_path", Path(teacher_ref).exists()))
+    else:
+        teacher_ref, teacher_is_local = resolve_model_ref(args.teacher_model, args.local_models_only)
+    if reused_student_summary is not None:
+        student_ref = str(reused_student_summary.get("student_model") or args.student_model)
+        student_is_local = bool(reused_student_summary.get("student_model_is_local_path", Path(student_ref).exists()))
+    else:
+        student_ref, student_is_local = resolve_model_ref(args.student_model, args.local_models_only)
     log_state("model_refs_resolved", teacher_local=teacher_is_local, student_local=student_is_local)
 
     common = [
@@ -1049,14 +1125,8 @@ def main() -> None:
     teacher_model_args = [f"pretrained={teacher_ref}", "trust_remote_code=True", "dtype=auto"]
     student_model_args = [f"pretrained={student_ref}", "trust_remote_code=True", "dtype=auto"]
     if int(args.gpu_optimize_6gb) == 1 and str(args.device).startswith("cuda"):
-        offload_dir = out_dir / "offload"
-        offload_dir.mkdir(parents=True, exist_ok=True)
         six_gb_profile = [
             "dtype=float16",
-            "parallelize=True",
-            "max_memory_per_gpu=5GiB",
-            "max_cpu_memory=48GiB",
-            f"offload_folder={offload_dir}",
         ]
         teacher_model_args = _merge_model_arg_list(teacher_model_args, six_gb_profile)
         student_model_args = _merge_model_arg_list(student_model_args, six_gb_profile)
@@ -1079,107 +1149,155 @@ def main() -> None:
     ]
 
     if args.dry_run:
-        LOGGER.info("DRY teacher: %s", " ".join(teacher_cmd))
-        LOGGER.info("DRY student: %s", " ".join(student_cmd))
+        if args.resume_student_only:
+            LOGGER.info("DRY teacher: skipped (--resume-student-only)")
+        elif reused_teacher_summary is not None:
+            LOGGER.info("DRY teacher: skipped (--reuse-teacher-comparison-json=%s)", args.reuse_teacher_comparison_json)
+        else:
+            LOGGER.info("DRY teacher: %s", " ".join(teacher_cmd))
+        if reused_student_summary is not None:
+            LOGGER.info("DRY student: skipped (--reuse-student-comparison-json=%s)", args.reuse_student_comparison_json)
+        else:
+            LOGGER.info("DRY student: %s", " ".join(student_cmd))
         log_state("dry_run_end", teacher_cmd_len=len(teacher_cmd), student_cmd_len=len(student_cmd))
         return
 
     rtx_4050_env = os.environ.copy()
     rtx_4050_env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    teacher_eval_started = time.perf_counter()
-    log_state("teacher_eval_start", output=str(teacher_out))
-    try:
-        run_cmd(teacher_cmd, Path.cwd(), retries=max(0, int(args.retry_count)))
-    except subprocess.CalledProcessError:
-        fallback_gen_toks = max(16, int(args.teacher_fallback_max_gen_toks))
-        fallback_cmd = _replace_flag_value(teacher_cmd, "--device", str(args.teacher_fallback_device))
-        fallback_cmd = _replace_flag_value(
-            fallback_cmd,
-            "--gen_kwargs",
-            f"do_sample=False,temperature=0.0,max_gen_toks={fallback_gen_toks}",
-        )
-        fallback_env: dict[str, str] | None = None
-        if int(args.gpu_optimize_6gb) == 1 and str(args.teacher_fallback_device).startswith("cuda"):
-            LOGGER.warning(
-                "Teacher lm-eval failed. Applying RTX 4050 6GB CUDA profile (fp16 + allocator tuning) before fallback."
+    if args.resume_student_only:
+        probe_teacher_res, probe_teacher_samples = normalize_model_artifacts(teacher_out)
+        if probe_teacher_res is None:
+            raise FileNotFoundError(
+                f"--resume-student-only requires existing teacher results under {teacher_out}."
             )
-            fallback_cmd = _append_model_args(fallback_cmd, ["dtype=float16"])
-            fallback_env = rtx_4050_env
-        LOGGER.warning(
-            "Teacher lm-eval failed after retries. Retrying with fallback device=%s max_gen_toks=%s.",
-            args.teacher_fallback_device,
-            fallback_gen_toks,
-        )
+        log_state("teacher_eval_skipped_resume_student_only", output=str(teacher_out))
+    elif reused_teacher_summary is not None:
+        log_state("teacher_eval_skipped_reuse", comparison_json=str(args.reuse_teacher_comparison_json))
+    else:
+        teacher_eval_started = time.perf_counter()
+        log_state("teacher_eval_start", output=str(teacher_out))
         try:
-            run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env)
+            run_cmd(teacher_cmd, Path.cwd(), retries=max(0, int(args.retry_count)))
         except subprocess.CalledProcessError:
-            if int(args.gpu_optimize_6gb) != 1 or not str(args.teacher_fallback_device).startswith("cuda"):
-                raise
-            offload_cmd = _append_model_args(
+            fallback_gen_toks = max(16, int(args.teacher_fallback_max_gen_toks))
+            fallback_cmd = _replace_flag_value(teacher_cmd, "--device", str(args.teacher_fallback_device))
+            fallback_cmd = _replace_flag_value(
                 fallback_cmd,
-                [
-                    "parallelize=True",
-                    "max_memory_per_gpu=5GiB",
-                    "max_cpu_memory=48GiB",
-                ],
+                "--gen_kwargs",
+                f"do_sample=False,temperature=0.0,max_gen_toks={fallback_gen_toks}",
             )
-            LOGGER.warning("Teacher CUDA retry still failed. Retrying with CUDA+CPU offload profile.")
-            run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env)
-    log_state("teacher_eval_end", output=str(teacher_out), elapsed_s=f"{(time.perf_counter() - teacher_eval_started):.2f}")
-
-    student_eval_started = time.perf_counter()
-    log_state("student_eval_start", output=str(student_out))
-    try:
-        run_cmd(student_cmd, Path.cwd(), retries=max(0, int(args.retry_count)))
-    except subprocess.CalledProcessError:
-        fallback_gen_toks = max(16, int(args.student_fallback_max_gen_toks))
-        fallback_cmd = _replace_flag_value(student_cmd, "--device", str(args.student_fallback_device))
-        fallback_cmd = _replace_flag_value(
-            fallback_cmd,
-            "--gen_kwargs",
-            f"do_sample=False,temperature=0.0,max_gen_toks={fallback_gen_toks}",
-        )
-        fallback_env: dict[str, str] | None = None
-        if int(args.gpu_optimize_6gb) == 1 and str(args.student_fallback_device).startswith("cuda"):
+            fallback_env: dict[str, str] | None = None
+            if int(args.gpu_optimize_6gb) == 1 and str(args.teacher_fallback_device).startswith("cuda"):
+                LOGGER.warning(
+                    "Teacher lm-eval failed. Applying RTX 4050 6GB CUDA profile (fp16 + allocator tuning) before fallback."
+                )
+                fallback_cmd = _append_model_args(fallback_cmd, ["dtype=float16"])
+                fallback_env = rtx_4050_env
             LOGGER.warning(
-                "Student lm-eval failed. Applying RTX 4050 6GB CUDA profile (fp16 + allocator tuning) before fallback."
+                "Teacher lm-eval failed after retries. Retrying with fallback device=%s max_gen_toks=%s.",
+                args.teacher_fallback_device,
+                fallback_gen_toks,
             )
-            fallback_cmd = _append_model_args(fallback_cmd, ["dtype=float16"])
-            fallback_env = rtx_4050_env
-        LOGGER.warning(
-            "Student lm-eval failed after retries. Retrying with fallback device=%s max_gen_toks=%s.",
-            args.student_fallback_device,
-            fallback_gen_toks,
-        )
-        try:
-            run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env)
-        except subprocess.CalledProcessError:
-            if int(args.gpu_optimize_6gb) != 1 or not str(args.student_fallback_device).startswith("cuda"):
-                raise
-            offload_cmd = _append_model_args(
-                fallback_cmd,
-                [
-                    "parallelize=True",
-                    "max_memory_per_gpu=5GiB",
-                    "max_cpu_memory=48GiB",
-                ],
-            )
-            LOGGER.warning("Student CUDA retry still failed. Retrying with CUDA+CPU offload profile.")
-            run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env)
-    log_state("student_eval_end", output=str(student_out), elapsed_s=f"{(time.perf_counter() - student_eval_started):.2f}")
+            try:
+                run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env)
+            except subprocess.CalledProcessError:
+                if int(args.gpu_optimize_6gb) != 1 or not str(args.teacher_fallback_device).startswith("cuda"):
+                    raise
+                offload_cmd = _append_model_args(
+                    fallback_cmd,
+                    [ 
+                        "max_memory_per_gpu=5GiB",
+                        "max_cpu_memory=48GiB",
+                    ],
+                )
+                LOGGER.warning("Teacher CUDA retry still failed. Retrying with CUDA+CPU offload profile.")
+                run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env)
+        log_state("teacher_eval_end", output=str(teacher_out), elapsed_s=f"{(time.perf_counter() - teacher_eval_started):.2f}")
 
-    log_state("artifact_normalize_start", teacher_out=str(teacher_out), student_out=str(student_out))
-    teacher_res, teacher_samples = normalize_model_artifacts(teacher_out)
-    student_res, student_samples = normalize_model_artifacts(student_out)
+    if reused_student_summary is not None:
+        log_state("student_eval_skipped_reuse", comparison_json=str(args.reuse_student_comparison_json))
+    else:
+        student_eval_started = time.perf_counter()
+        log_state("student_eval_start", output=str(student_out))
+        try:
+            run_cmd(student_cmd, Path.cwd(), retries=max(0, int(args.retry_count)))
+        except subprocess.CalledProcessError:
+            fallback_gen_toks = max(16, int(args.student_fallback_max_gen_toks))
+            fallback_cmd = _replace_flag_value(student_cmd, "--device", str(args.student_fallback_device))
+            fallback_cmd = _replace_flag_value(
+                fallback_cmd,
+                "--gen_kwargs",
+                f"do_sample=False,temperature=0.0,max_gen_toks={fallback_gen_toks}",
+            )
+            fallback_env: dict[str, str] | None = None
+            if int(args.gpu_optimize_6gb) == 1 and str(args.student_fallback_device).startswith("cuda"):
+                LOGGER.warning(
+                    "Student lm-eval failed. Applying RTX 4050 6GB CUDA profile (fp16 + allocator tuning) before fallback."
+                )
+                fallback_cmd = _append_model_args(fallback_cmd, ["dtype=float16"])
+                fallback_env = rtx_4050_env
+            LOGGER.warning(
+                "Student lm-eval failed after retries. Retrying with fallback device=%s max_gen_toks=%s.",
+                args.student_fallback_device,
+                fallback_gen_toks,
+            )
+            try:
+                run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env)
+            except subprocess.CalledProcessError:
+                if int(args.gpu_optimize_6gb) != 1 or not str(args.student_fallback_device).startswith("cuda"):
+                    raise
+                offload_cmd = _append_model_args(
+                    fallback_cmd,
+                    [
+                        "parallelize=True",
+                        "max_memory_per_gpu=5GiB",
+                        "max_cpu_memory=48GiB",
+                    ],
+                )
+                LOGGER.warning("Student CUDA retry still failed. Retrying with CUDA+CPU offload profile.")
+                run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env)
+        log_state("student_eval_end", output=str(student_out), elapsed_s=f"{(time.perf_counter() - student_eval_started):.2f}")
+
+    log_state(
+        "artifact_normalize_start",
+        teacher_out=str(teacher_out),
+        student_out=str(student_out),
+        teacher_reused=bool(reused_teacher_summary is not None),
+        student_reused=bool(reused_student_summary is not None),
+    )
+    if reused_teacher_summary is not None:
+        teacher_res = _path_from_summary(reused_teacher_summary, "teacher_results_json", "teacher")
+        teacher_samples = _path_from_summary(reused_teacher_summary, "teacher_samples_jsonl", "teacher")
+    else:
+        teacher_res, teacher_samples = normalize_model_artifacts(teacher_out)
+    if reused_student_summary is not None:
+        student_res = _path_from_summary(reused_student_summary, "student_results_json", "student")
+        student_samples = _path_from_summary(reused_student_summary, "student_samples_jsonl", "student")
+    else:
+        student_res, student_samples = normalize_model_artifacts(student_out)
     log_state(
         "artifact_normalize_end",
         teacher_results=str(teacher_res) if teacher_res else "none",
         student_results=str(student_res) if student_res else "none",
     )
 
-    lm_t_score, lm_t_metric_key = extract_score(teacher_res, task_name) if teacher_res else (None, None)
-    lm_s_score, lm_s_metric_key = extract_score(student_res, task_name) if student_res else (None, None)
+    if reused_teacher_summary is not None:
+        lm_t_score_raw = reused_teacher_summary.get("teacher_lm_eval_exact_match")
+        lm_t_score = float(lm_t_score_raw) if isinstance(lm_t_score_raw, (int, float)) else None
+        lm_t_metric_key = reused_teacher_summary.get("teacher_lm_eval_metric_key")
+        if lm_t_metric_key is not None:
+            lm_t_metric_key = str(lm_t_metric_key)
+    else:
+        lm_t_score, lm_t_metric_key = extract_score(teacher_res, task_name) if teacher_res else (None, None)
+    if reused_student_summary is not None:
+        lm_s_score_raw = reused_student_summary.get("student_lm_eval_exact_match")
+        lm_s_score = float(lm_s_score_raw) if isinstance(lm_s_score_raw, (int, float)) else None
+        lm_s_metric_key = reused_student_summary.get("student_lm_eval_metric_key")
+        if lm_s_metric_key is not None:
+            lm_s_metric_key = str(lm_s_metric_key)
+    else:
+        lm_s_score, lm_s_metric_key = extract_score(student_res, task_name) if student_res else (None, None)
 
     sample_cmp = build_sample_comparison(
         teacher_samples,
@@ -1203,9 +1321,19 @@ def main() -> None:
     if t_score is None:
         t_score = lm_t_score
         t_metric_key = lm_t_metric_key
+    if reused_teacher_summary is not None and t_score is None:
+        reused_teacher_score = reused_teacher_summary.get("teacher_exact_match")
+        if isinstance(reused_teacher_score, (int, float)):
+            t_score = float(reused_teacher_score)
+            t_metric_key = str(reused_teacher_summary.get("teacher_metric_key") or "reused")
     if s_score is None:
         s_score = lm_s_score
         s_metric_key = lm_s_metric_key
+    if reused_student_summary is not None and s_score is None:
+        reused_student_score = reused_student_summary.get("student_exact_match")
+        if isinstance(reused_student_score, (int, float)):
+            s_score = float(reused_student_score)
+            s_metric_key = str(reused_student_summary.get("student_metric_key") or "reused")
 
     sample_columns_jsonl = out_dir / "sample_columns.jsonl"
     write_sample_columns_jsonl(sample_columns_jsonl, sample_cmp)
@@ -1228,6 +1356,9 @@ def main() -> None:
         "teacher_model_is_local_path": teacher_is_local,
         "student_model_is_local_path": student_is_local,
         "local_models_only": bool(args.local_models_only),
+        "fast_mode": bool(args.fast_mode),
+        "teacher_reused_from_comparison_json": str(args.reuse_teacher_comparison_json) if reused_teacher_summary is not None else None,
+        "student_reused_from_comparison_json": str(args.reuse_student_comparison_json) if reused_student_summary is not None else None,
         "teacher_results_json": str(teacher_res) if teacher_res else None,
         "student_results_json": str(student_res) if student_res else None,
         "teacher_samples_jsonl": str(teacher_samples) if teacher_samples else None,
@@ -1281,6 +1412,9 @@ def main() -> None:
         f"- Dataset arrow: `{dataset_arrow_str}`",
         f"- Dataset jsonl: `{data_jsonl}`",
         f"- Rows: `{n_rows}`",
+        f"- Fast mode: `{bool(args.fast_mode)}`",
+        f"- Teacher reused: `{args.reuse_teacher_comparison_json}`",
+        f"- Student reused: `{args.reuse_student_comparison_json}`",
         "",
         "## Scores",
         "",
