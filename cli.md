@@ -253,37 +253,170 @@ Key options:
 
 ---
 
-## `run_student_distill_from_teacher.py`
+## `build_distill_variants.py`
 
 Purpose:
 
-- End-to-end student distillation runner from optimization summary.
+- First step of the new distillation flow.
+- Reads a source `comparison.json`, filters `teacher correct / student wrong` rows, builds the three reusable training variants, and writes a dataset manifest JSON.
 
 Usage:
 
 ```bash
-uv run python newScripts/run_student_distill_from_teacher.py \
-  --summary-json <teacher_optimization_summary.json> [options]
+uv run python -m newScripts.build_distill_variants \
+  --comparison-json <comparison.json> [options]
 ```
 
 Key options:
 
-- Gate/control: `--summary-json`, `--allow-ungated-summary`, `--dry-run`
-- Distill dataset build: `--distill-mode` (alias: `--distill-modesar`), `--distill-rows`, `--gold-mix-ratio`, `--gold-rows`, `--mix-seed`
-- Student train: `--student-epochs`, `--student-lr`, `--student-batch-size`, `--student-grad-accum`, `--student-max-seq-length`
-- Eval: `--dataset-path`, `--split`, `--max-samples`, `--num-fewshot`, `--gen-max-toks`, `--device`, `--batch-size`
+- Required: `--comparison-json`
+- Output/layout: `--output-root`, `--phase-name`, `--pipeline-run-id`
+- Filtering/rendering: `--max-filtered-rows`, `--max-answer-chars`, `--short-rationale-max-sentences`, `--short-rationale-max-chars`
 
 Example:
 
 ```bash
-uv run python newScripts/run_student_distill_from_teacher.py \
-  --summary-json newoutput/teacher_optimization_summary.json \
-  --allow-ungated-summary 1
+uv run python -m newScripts.build_distill_variants \
+  --comparison-json newoutput/lm_eval/before-distill-before-distill-v2/comparison.json \
+  --output-root newoutput/distill \
+  --phase-name next-distill-phase \
+  --pipeline-run-id v2 \
+  --max-filtered-rows 5000
+```
+
+Outputs:
+
+- `newoutput/distill/<phase-slug>/datasets/answer_only.jsonl`
+- `newoutput/distill/<phase-slug>/datasets/short_rationale.jsonl`
+- `newoutput/distill/<phase-slug>/datasets/full_rationale.jsonl`
+- `newoutput/distill/<phase-slug>/manifests/dataset_manifest.json`
+- `newoutput/distill/<phase-slug>/manifests/filtered_subset_summary.json`
+
+---
+
+## `build_distill_mix.py`
+
+Purpose:
+
+- Rebuilds the winner-format `gold`, `pure`, and `mixed` datasets from a previously generated dataset manifest.
+
+Usage:
+
+```bash
+uv run python -m newScripts.build_distill_mix \
+  --dataset-manifest-json <dataset_manifest.json> \
+  --winner-format <answer_only|short_rationale|full_rationale> [options]
+```
+
+Key options:
+
+- Required: `--dataset-manifest-json`, `--winner-format`
+- Mixing: `--mixed-gold-ratio`, `--mixed-seed`
+
+Example:
+
+```bash
+uv run python -m newScripts.build_distill_mix \
+  --dataset-manifest-json newoutput/distill/next-distill-phase-v2/manifests/dataset_manifest.json \
+  --winner-format short_rationale \
+  --mixed-gold-ratio 0.30 \
+  --mixed-seed 42
+```
+
+Outputs:
+
+- `newoutput/distill/<phase-slug>/datasets/<winner-format>_pure.jsonl`
+- `newoutput/distill/<phase-slug>/datasets/<winner-format>_gold.jsonl`
+- `newoutput/distill/<phase-slug>/datasets/<winner-format>_mixed.jsonl`
+- `newoutput/distill/<phase-slug>/manifests/mix_manifest_<winner-format>.json`
+
+---
+
+## `run_student_distill_from_teacher.py`
+
+Purpose:
+
+- Thin orchestration layer for the new distillation pipeline.
+- Consumes a dataset manifest, trains the three format variants, evaluates benchmark + heldout sets, selects the winner, builds pure/mixed datasets, and writes the final phase summary.
+
+Usage:
+
+```bash
+uv run python -m newScripts.run_student_distill_from_teacher \
+  --dataset-manifest-json <dataset_manifest.json> [options]
+```
+
+Key options:
+
+- Required: `--dataset-manifest-json`
+- Teacher/run context: `--summary-json`, `--teacher-model`, `--experiment-name`, `--pipeline-run-id`, `--parent-eval`
+- Student train: `--student-base-model`, `--student-epochs`, `--student-lr`, `--student-batch-size`, `--student-grad-accum`, `--student-max-seq-length`, `--student-max-train-samples`, `--student-max-eval-samples`, `--student-seed`, `--train-val-ratio`, `--split-seed`
+- Benchmark/heldout eval: `--benchmark-dataset-path`, `--benchmark-split`, `--benchmark-max-samples`, `--heldout-dataset-path`, `--heldout-split`, `--heldout-max-samples`
+- Generation/runtime: `--num-fewshot`, `--gen-max-toks`, `--device`, `--batch-size`, `--limit`
+- Mixing/control: `--mixed-gold-ratio`, `--mixed-seed`, `--dry-run`
+
+Example:
+
+```bash
+uv run python -m newScripts.run_student_distill_from_teacher \
+  --dataset-manifest-json newoutput/distill/next-distill-phase-v2/manifests/dataset_manifest.json \
+  --summary-json newoutput/teacher_optimization_summary_bootstrap.json \
+  --experiment-name distill-format-ablation \
+  --pipeline-run-id v2
 ```
 
 Note:
 
-- Use `--distill-mode`; legacy alias `--distill-modesar` is still accepted.
+- This script no longer builds the initial variant datasets inline. Run `build_distill_variants.py` first.
+
+---
+
+## `run.sh`
+
+Purpose:
+
+- Canonical full pipeline wrapper for the new distillation flow.
+- Resolves the source `comparison.json` from the teacher summary, builds variant datasets, runs the distillation orchestrator, and rebuilds the eval dashboard.
+
+Usage:
+
+```bash
+./newScripts/run.sh
+```
+
+Environment variables:
+
+- `RUN_ID`
+- `EXP`
+- `PHASE_NAME`
+- `OUTPUT_ROOT`
+- `PINNED_SUMMARY`
+- `COMPARISON_JSON`
+- `PHASE_SLUG`
+- `DATASET_MANIFEST_JSON`
+- `MAX_FILTERED_ROWS`
+- `BENCHMARK_DATASET_PATH`
+- `HELDOUT_DATASET_PATH`
+- `DRY_RUN`
+
+Example:
+
+```bash
+RUN_ID=v2 \
+PHASE_NAME=next-distill-phase \
+MAX_FILTERED_ROWS=5000 \
+./newScripts/run.sh
+```
+
+Dry-run example:
+
+```bash
+RUN_ID=smoke1 \
+PHASE_NAME=distill-smoke \
+MAX_FILTERED_ROWS=5 \
+DRY_RUN=1 \
+./newScripts/run.sh
+```
 
 ---
 
