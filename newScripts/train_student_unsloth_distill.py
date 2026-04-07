@@ -3,33 +3,28 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import random
-import sys
 from pathlib import Path
 
 from datasets import Dataset, load_dataset
+from newScripts.common import (
+    ANSWER_CONTRACT_INSTRUCTION,
+    ANSWER_FIELD,
+    QUESTION_FIELD,
+    configure_logging,
+    utc_now,
+)
 
 DEFAULT_BASE_MODEL = "/media/prasanna/716F26140AED9B67/models/models--Qwen--Qwen2-0.5B-Instruct"
 LOGGER = logging.getLogger("train_student_unsloth")
 
 SYSTEM_PROMPT = (
-    "You are a careful math tutor. Solve step by step and end with "
-    "'The answer is <number>.'."
+    "You are a careful math tutor. "
+    + ANSWER_CONTRACT_INSTRUCTION
 )
-
-
-def configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stdout,
-        force=True,
-    )
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Distill student model using teacher-generated GSM8K-style JSONL.")
     p.add_argument("--base-model", type=str, default=DEFAULT_BASE_MODEL)
@@ -49,8 +44,8 @@ def parse_args() -> argparse.Namespace:
         default=42,
         help="Seed used when creating deterministic train/eval split from train JSONL.",
     )
-    p.add_argument("--output-dir", type=str, default="output/student-gsm8k-distill-lora")
-    p.add_argument("--merged-output-dir", type=str, default="output/student-gsm8k-distill-merged")
+    p.add_argument("--output-dir", type=str, default="newoutput/student-gsm8k-distill/lora")
+    p.add_argument("--merged-output-dir", type=str, default="newoutput/student-gsm8k-distill/merged")
 
     p.add_argument("--max-seq-length", type=int, default=2048)
     p.add_argument("--load-in-4bit", type=int, choices=[0, 1], default=1)
@@ -69,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-steps", type=int, default=1000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--merge-16bit", type=int, choices=[0, 1], default=1)
+    p.add_argument("--packing", type=int, choices=[0, 1], default=0)
     return p.parse_args()
 
 
@@ -77,8 +73,8 @@ def load_jsonl_dataset(path: str) -> Dataset:
     if not p.exists():
         raise FileNotFoundError(f"JSONL dataset not found: {p}")
     ds = load_dataset("json", data_files=str(p), split="train")
-    if "question" not in ds.column_names or "answer" not in ds.column_names:
-        raise ValueError(f"JSONL must contain 'question' and 'answer' fields: {p}")
+    if QUESTION_FIELD not in ds.column_names or ANSWER_FIELD not in ds.column_names:
+        raise ValueError(f"JSONL must contain '{QUESTION_FIELD}' and '{ANSWER_FIELD}' fields: {p}")
     return ds
 
 
@@ -122,8 +118,8 @@ def _format_row(question: str, answer: str, tokenizer: object) -> str:
 
 def prepare_dataset(ds: Dataset, tokenizer: object) -> Dataset:
     def _mapper(row: dict) -> dict:
-        q = str(row.get("question", "")).strip()
-        a = str(row.get("answer", "")).strip()
+        q = str(row.get(QUESTION_FIELD, "")).strip()
+        a = str(row.get(ANSWER_FIELD, "")).strip()
         return {"text": _format_row(q, a, tokenizer)}
 
     return ds.map(_mapper, remove_columns=ds.column_names)
@@ -182,7 +178,8 @@ def resolve_base_model_ref(model_ref: str) -> str:
 
 
 def main() -> None:
-    configure_logging()
+    global LOGGER
+    LOGGER = configure_logging("train_student_unsloth")
     args = parse_args()
 
     try:
@@ -267,6 +264,7 @@ def main() -> None:
         fp16=not bf16_ok,
         seed=args.seed,
         report_to="none",
+        packing=bool(args.packing),
     )
 
     trainer = SFTTrainer(
@@ -278,7 +276,7 @@ def main() -> None:
     )
 
     LOGGER.info("TRAIN starting student distillation fine-tune...")
-    trainer.train()
+    train_result = trainer.train()
 
     LOGGER.info("SAVE lora_dir=%s", out_dir)
     model.save_pretrained(str(out_dir))
@@ -291,6 +289,48 @@ def main() -> None:
         model.save_pretrained_merged(str(merged_dir), tokenizer, save_method="merged_16bit")
         if not list(merged_dir.glob("*")):
             raise RuntimeError("Merged student export produced no files.")
+
+    log_history = list(getattr(trainer.state, "log_history", []) or [])
+    eval_losses = [float(item["eval_loss"]) for item in log_history if isinstance(item, dict) and isinstance(item.get("eval_loss"), (int, float))]
+    train_summary = {
+        "created_at_utc": utc_now(),
+        "base_model": args.base_model,
+        "resolved_base_model": resolved_base_model,
+        "train_jsonl": args.train_jsonl,
+        "eval_jsonl": args.eval_jsonl if args.eval_jsonl else None,
+        "train_rows": len(train_ds),
+        "eval_rows": len(eval_ds),
+        "chat_template_sig": chat_template_sig,
+        "system_prompt": SYSTEM_PROMPT,
+        "hyperparameters": {
+            "epochs": float(args.epochs),
+            "learning_rate": float(args.learning_rate),
+            "batch_size": int(args.batch_size),
+            "grad_accum": int(args.grad_accum),
+            "max_seq_length": int(args.max_seq_length),
+            "warmup_ratio": float(args.warmup_ratio),
+            "weight_decay": float(args.weight_decay),
+            "seed": int(args.seed),
+            "packing": bool(args.packing),
+        },
+        "lora": {
+            "r": int(args.lora_r),
+            "alpha": int(args.lora_alpha),
+            "dropout": float(args.lora_dropout),
+        },
+        "train_metrics": dict(getattr(train_result, "metrics", {}) or {}),
+        "final_train_loss": (
+            float(getattr(train_result, "metrics", {}).get("train_loss"))
+            if isinstance(getattr(train_result, "metrics", {}).get("train_loss"), (int, float))
+            else None
+        ),
+        "eval_loss_summary": {
+            "count": len(eval_losses),
+            "min_eval_loss": min(eval_losses) if eval_losses else None,
+            "last_eval_loss": eval_losses[-1] if eval_losses else None,
+        },
+    }
+    (out_dir / "train_summary.json").write_text(json.dumps(train_summary, indent=2), encoding="utf-8")
 
     LOGGER.info("DONE student distillation complete.")
 

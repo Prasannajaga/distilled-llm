@@ -9,7 +9,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -17,6 +16,41 @@ from pathlib import Path
 from typing import Any
 
 from datasets import Dataset, load_dataset
+from newScripts.common import (
+    ANSWER_CONTRACT_INSTRUCTION,
+    ANSWER_FIELD,
+    BUCKET_BOTH_CORRECT,
+    BUCKET_BOTH_WRONG,
+    BUCKET_TEACHER_CORRECT_STUDENT_WRONG,
+    BUCKET_TEACHER_WRONG_STUDENT_CORRECT,
+    EXAMPLES_KEY,
+    GOLD_ANSWER_FIELD,
+    GOLD_FIELD,
+    QUESTION_FIELD,
+    SAMPLE_COMPARISON_KEY,
+    STUDENT_EXTRACTED_FIELD,
+    STUDENT_MATCH_FIELD,
+    STUDENT_PRED_FIELD,
+    STUDENT_RAW_FIELD,
+    STUDENT_RAW_PREDICTION_FIELD,
+    STUDENT_OK_FIELD,
+    TEACHER_EXTRACTED_FIELD,
+    TEACHER_MATCH_FIELD,
+    TEACHER_PRED_FIELD,
+    TEACHER_RAW_FIELD,
+    TEACHER_RAW_PREDICTION_FIELD,
+    TEACHER_OK_FIELD,
+    WINNER_FIELD,
+    WINNER_LABEL_FIELD,
+    answers_match,
+    compute_bucket_metrics,
+    compute_overlap_report,
+    configure_logging as common_configure_logging,
+    extract_priority_answer,
+    log_state as common_log_state,
+    read_json,
+    write_jsonl_rows,
+)
 
 DEFAULT_STUDENT_MODEL = "/media/prasanna/716F26140AED9B67/models/models--Qwen--Qwen2-0.5B-Instruct"
 DEFAULT_TEACHER_MODEL = "/media/prasanna/716F26140AED9B67/models/models--Qwen--Qwen2-Math-1.5B-Instruct"
@@ -24,25 +58,15 @@ DEFAULT_GSM8K_PATH = "/media/prasanna/716F26140AED9B67/datasets/GSM8K"
 LOGGER = logging.getLogger("run_lm_eval_custom")
 COMMAND_TAIL_LINES = 25
 HEARTBEAT_SECONDS = 30
-ECHO_SUBPROCESS = False
-
-
-def log_state(state: str, **fields: Any) -> None:
-    payload = " ".join(f"{k}={fields[k]}" for k in sorted(fields))
-    if payload:
-        LOGGER.info("STATE | %s | %s", state, payload)
-    else:
-        LOGGER.info("STATE | %s", state)
 
 
 def configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stdout,
-        force=True,
-    )
+    global LOGGER
+    LOGGER = common_configure_logging("run_lm_eval_custom")
+
+
+def log_state(state: str, **fields: Any) -> None:
+    common_log_state(LOGGER, state, **fields)
 
 
 def utc_now() -> str:
@@ -52,6 +76,12 @@ def utc_now() -> str:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run custom lm-eval benchmark on local GSM8K-style dataset")
     p.add_argument("--dataset-path", type=str, default=DEFAULT_GSM8K_PATH)
+    p.add_argument(
+        "--dataset-jsonl",
+        type=str,
+        default=None,
+        help="Optional direct JSONL dataset path with question/answer fields. If set, bypasses dataset-path/split loading.",
+    )
     p.add_argument("--split", choices=["train", "test"], default="test")
     p.add_argument("--max-samples", type=int, default=0)
     p.add_argument("--student-model", type=str, default=DEFAULT_STUDENT_MODEL)
@@ -72,10 +102,49 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to an existing comparison.json to reuse teacher artifacts/scores without re-running teacher lm-eval.",
     )
+    p.add_argument(
+        "--reuse-dataset-jsonl-from-comparison",
+        type=str,
+        default=None,
+        help="Optional comparison.json whose dataset_jsonl should be reused exactly for this run.",
+    )
     p.add_argument("--teacher-model", type=str, default=DEFAULT_TEACHER_MODEL)
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--batch-size", type=str, default="1")
     p.add_argument("--limit", type=str, default=None, help="lm-eval limit, e.g. 100 or 0.1")
+    p.add_argument(
+        "--allow-env-limit",
+        action="store_true",
+        help="If set and --limit is not passed, allow LIMIT/EVAL_LIMIT env var to provide lm-eval limit.",
+    )
+    p.add_argument(
+        "--allow-partial-eval",
+        action="store_true",
+        help="If set, do not hard-fail when evaluated rows are smaller than expected rows.",
+    )
+    p.add_argument(
+        "--expected-rows",
+        type=int,
+        default=0,
+        help="Optional explicit expected row count for eval-integrity checks (<=0 uses dataset rows).",
+    )
+    p.add_argument(
+        "--overlap-reference",
+        action="append",
+        default=[],
+        help="Reference split for overlap check, format name=path (path may be jsonl or comparison.json).",
+    )
+    p.add_argument(
+        "--overlap-threshold",
+        type=float,
+        default=0.0,
+        help="Max allowed overlap fraction for eval-vs-reference checks (default 0.0).",
+    )
+    p.add_argument(
+        "--allow-overlap",
+        action="store_true",
+        help="Allow overlap above threshold (still logs loud warning and writes overlap report).",
+    )
     p.add_argument("--num-fewshot", type=int, default=8)
     p.add_argument("--gen-max-toks", type=int, default=256)
     p.add_argument("--retry-count", type=int, default=1, help="Retries per lm-eval subprocess command.")
@@ -170,6 +239,13 @@ def parse_args() -> argparse.Namespace:
         help="Clear existing output dir before running (keeps stable naming; no auto timestamp suffix).",
     )
     p.add_argument("--output-dir", type=str, default=None)
+    p.add_argument(
+        "--echo-subprocess",
+        type=int,
+        choices=[0, 1],
+        default=1,
+        help="If 1, stream child lm-eval output live instead of only keeping it in the failure tail.",
+    )
     p.add_argument("--render-html", type=int, choices=[0, 1], default=1, help="Render report.html at end of run")
     p.add_argument(
         "--html-limit",
@@ -272,11 +348,11 @@ def to_jsonl_from_arrow(split_arrow: Path, out_jsonl: Path, max_samples: int) ->
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with out_jsonl.open("w", encoding="utf-8") as f:
         for row in ds:
-            q = str(row.get("question", "")).strip()
-            a = str(row.get("answer", "")).strip()
+            q = str(row.get(QUESTION_FIELD, "")).strip()
+            a = str(row.get(ANSWER_FIELD, "")).strip()
             if not q or not a:
                 continue
-            f.write(json.dumps({"question": q, "answer": a}, ensure_ascii=False) + "\n")
+            f.write(json.dumps({QUESTION_FIELD: q, ANSWER_FIELD: a}, ensure_ascii=False) + "\n")
             count += 1
             if max_samples > 0 and count >= max_samples:
                 break
@@ -289,15 +365,216 @@ def to_jsonl_from_hf(split: str, out_jsonl: Path, max_samples: int) -> int:
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with out_jsonl.open("w", encoding="utf-8") as f:
         for row in ds:
-            q = str(row.get("question", "")).strip()
-            a = str(row.get("answer", "")).strip()
+            q = str(row.get(QUESTION_FIELD, "")).strip()
+            a = str(row.get(ANSWER_FIELD, "")).strip()
             if not q or not a:
                 continue
-            f.write(json.dumps({"question": q, "answer": a}, ensure_ascii=False) + "\n")
+            f.write(json.dumps({QUESTION_FIELD: q, ANSWER_FIELD: a}, ensure_ascii=False) + "\n")
             count += 1
             if max_samples > 0 and count >= max_samples:
                 break
     return count
+
+
+def copy_jsonl_dataset(src_jsonl: Path, out_jsonl: Path, max_samples: int) -> int:
+    count = 0
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with src_jsonl.open("r", encoding="utf-8") as src, out_jsonl.open("w", encoding="utf-8") as dst:
+        for line in src:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            q = str(row.get(QUESTION_FIELD, "")).strip()
+            a = str(row.get(ANSWER_FIELD, "")).strip()
+            if not q or not a:
+                continue
+            dst.write(json.dumps({QUESTION_FIELD: q, ANSWER_FIELD: a}, ensure_ascii=False) + "\n")
+            count += 1
+            if max_samples > 0 and count >= max_samples:
+                break
+    return count
+
+
+def resolve_limit_config(
+    cli_limit: str | None,
+    *,
+    allow_env_limit: bool,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    raw_cli = str(cli_limit).strip() if cli_limit is not None else ""
+    if raw_cli:
+        return {
+            "active": True,
+            "value": raw_cli,
+            "source": "cli",
+            "ignored_env_limit": None,
+        }
+    env_map = env if env is not None else os.environ
+    inherited = str(env_map.get("EVAL_LIMIT", "") or env_map.get("LIMIT", "")).strip()
+    if inherited and allow_env_limit:
+        return {
+            "active": True,
+            "value": inherited,
+            "source": "env",
+            "ignored_env_limit": None,
+        }
+    return {
+        "active": False,
+        "value": None,
+        "source": "none",
+        "ignored_env_limit": inherited or None,
+    }
+
+
+def parse_named_path(raw: str) -> tuple[str, Path]:
+    text = str(raw or "").strip()
+    if not text or "=" not in text:
+        raise ValueError(f"Invalid --overlap-reference '{raw}'. Expected name=path.")
+    name, path = text.split("=", 1)
+    split_name = name.strip()
+    path_text = path.strip()
+    split_path = Path(path_text)
+    if not split_name:
+        raise ValueError(f"Invalid --overlap-reference '{raw}'. Empty name.")
+    if not path_text:
+        raise ValueError(f"Invalid --overlap-reference '{raw}'. Empty path.")
+    return split_name, split_path
+
+
+def _rows_from_comparison_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    sample_cmp = payload.get(SAMPLE_COMPARISON_KEY, {})
+    if isinstance(sample_cmp, dict):
+        examples = sample_cmp.get(EXAMPLES_KEY, [])
+        if isinstance(examples, list):
+            return [dict(row) for row in examples if isinstance(row, dict)]
+    return []
+
+
+def load_rows_for_overlap(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(f"Overlap reference file not found: {path}")
+    if path.suffix.lower() == ".jsonl":
+        rows = read_sample_rows(path, limit=None)
+        return [dict(row) for row in rows]
+    if path.suffix.lower() == ".json":
+        payload = read_json(path)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Invalid overlap JSON object: {path}")
+        rows = _rows_from_comparison_payload(payload)
+        if rows:
+            return rows
+        dataset_jsonl = payload.get("dataset_jsonl")
+        if isinstance(dataset_jsonl, str) and dataset_jsonl.strip():
+            return load_rows_for_overlap(Path(dataset_jsonl))
+        if isinstance(payload.get("rows"), list):
+            return [dict(row) for row in payload["rows"] if isinstance(row, dict)]
+    raise RuntimeError(f"Unsupported overlap reference format (expected jsonl/comparison.json): {path}")
+
+
+def evaluate_overlap_guardrails(
+    *,
+    eval_rows: list[dict[str, Any]],
+    references: list[tuple[str, Path]],
+    out_path: Path,
+    threshold: float,
+    allow_overlap: bool,
+) -> dict[str, Any]:
+    named_rows: dict[str, list[dict[str, Any]]] = {"eval": eval_rows}
+    reference_files: dict[str, str] = {}
+    for name, path in references:
+        rows = load_rows_for_overlap(path)
+        named_rows[name] = rows
+        reference_files[name] = str(path)
+
+    report = compute_overlap_report(named_rows)
+    report["threshold"] = float(threshold)
+    report["allow_overlap"] = bool(allow_overlap)
+    report["reference_files"] = reference_files
+    violations: list[dict[str, Any]] = []
+    for pair in report.get("pairwise", []):
+        if str(pair.get("left")) == "eval":
+            overlap_pct = pair.get("overlap_pct_of_left")
+        elif str(pair.get("right")) == "eval":
+            overlap_pct = pair.get("overlap_pct_of_right")
+        else:
+            overlap_pct = None
+        if isinstance(overlap_pct, (int, float)) and float(overlap_pct) > float(threshold):
+            violations.append(
+                {
+                    "left": pair.get("left"),
+                    "right": pair.get("right"),
+                    "overlap_count": pair.get("overlap_count"),
+                    "overlap_pct_eval": float(overlap_pct),
+                }
+            )
+    report["violations"] = violations
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    if violations and not allow_overlap:
+        first = violations[0]
+        raise RuntimeError(
+            "Overlap guardrail violation: eval split overlaps reference split above threshold. "
+            f"threshold={threshold} left={first.get('left')} right={first.get('right')} "
+            f"overlap_count={first.get('overlap_count')} overlap_pct_eval={first.get('overlap_pct_eval'):.6f}. "
+            "Use --allow-overlap to override explicitly."
+        )
+    if violations and allow_overlap:
+        LOGGER.warning(
+            "Overlap guardrail override active. Violations=%s threshold=%.6f",
+            len(violations),
+            float(threshold),
+        )
+    return report
+
+
+def infer_partial_eval_source(
+    *,
+    limit_cfg: dict[str, Any],
+    sample_comparison_limit: int,
+    reused_teacher: bool,
+    reused_student: bool,
+) -> str:
+    if bool(limit_cfg.get("active")):
+        return f"lm-eval --limit={limit_cfg.get('value')}"
+    if reused_teacher or reused_student:
+        return "reused comparison artifacts with fewer sample rows"
+    if int(sample_comparison_limit) > 0:
+        return f"sample comparison limit={int(sample_comparison_limit)}"
+    return "lm-eval sample/result mismatch; check output_path artifacts"
+
+
+def build_eval_integrity_status(
+    *,
+    expected_rows: int,
+    loaded_rows: int,
+    allow_partial_eval: bool,
+    likely_source: str,
+    limit_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "expected_rows": int(expected_rows),
+        "loaded_rows": int(loaded_rows),
+        "partial_eval_detected": int(loaded_rows) < int(expected_rows),
+        "allow_partial_eval": bool(allow_partial_eval),
+        "likely_mismatch_source": str(likely_source),
+        "limit_status": {
+            "active": bool(limit_cfg.get("active")),
+            "value": limit_cfg.get("value"),
+            "source": limit_cfg.get("source"),
+        },
+    }
+
+
+def build_partial_eval_error_message(integrity: dict[str, Any]) -> str:
+    return (
+        "Invalid partial evaluation detected: loaded rows are smaller than expected rows. "
+        f"expected_rows={integrity.get('expected_rows')} loaded_rows={integrity.get('loaded_rows')} "
+        f"likely_source='{integrity.get('likely_mismatch_source')}'. "
+        "This commonly happens when --limit is active or artifacts are reused from subset runs. "
+        "Use --allow-partial-eval only for explicit diagnostics."
+    )
 
 
 def write_task_yaml(
@@ -307,7 +584,7 @@ def write_task_yaml(
     task_name: str,
     fewshot_cot: bool,
 ) -> str:
-    doc_to_target = "{{answer}}" if fewshot_cot else "{{answer.split('####')[-1].strip()}}"
+    doc_to_target = f"{{{{{ANSWER_FIELD}}}}}" if fewshot_cot else f"{{{{{ANSWER_FIELD}.split('####')[-1].strip()}}}}"
     yaml = f"""task: {task_name}
 dataset_path: json
 dataset_kwargs:
@@ -318,7 +595,8 @@ test_split: test
 training_split: null
 validation_split: null
 doc_to_text: |
-  Q: {{{{question}}}}
+  Instruction: {ANSWER_CONTRACT_INSTRUCTION}
+  Q: {{{{{QUESTION_FIELD}}}}}
 
   A:
 doc_to_target: "{doc_to_target}"
@@ -365,11 +643,19 @@ metadata:
     return task_name
 
 
-def run_cmd(cmd: list[str], cwd: Path, retries: int = 0, env: dict[str, str] | None = None) -> None:
+def run_cmd(
+    cmd: list[str],
+    cwd: Path,
+    retries: int = 0,
+    env: dict[str, str] | None = None,
+    *,
+    echo_subprocess: bool,
+) -> None:
     LOGGER.info("CMD: %s", " ".join(cmd))
     last_exc: subprocess.CalledProcessError | None = None
     for attempt in range(retries + 1):
         start = time.perf_counter()
+        last_heartbeat = start
         tail: list[str] = []
         output_total = 0
         last_output_at = start
@@ -394,23 +680,25 @@ def run_cmd(cmd: list[str], cwd: Path, retries: int = 0, env: dict[str, str] | N
                     last_output_at = time.perf_counter()
                     if len(tail) > COMMAND_TAIL_LINES:
                         del tail[:-COMMAND_TAIL_LINES]
-                    if ECHO_SUBPROCESS:
+                    if echo_subprocess:
                         print(msg)
 
             t = threading.Thread(target=_reader, daemon=True)
             t.start()
             while proc.poll() is None:
-                time.sleep(HEARTBEAT_SECONDS)
+                time.sleep(1.0)
                 now = time.perf_counter()
                 elapsed = now - start
                 idle = now - last_output_at
-                LOGGER.info(
-                    "Still running (%.1fs): output_lines_total=%d tail_lines=%d last_output=%.1fs_ago",
-                    elapsed,
-                    output_total,
-                    len(tail),
-                    idle,
-                )
+                if idle >= HEARTBEAT_SECONDS and (now - last_heartbeat) >= HEARTBEAT_SECONDS:
+                    LOGGER.info(
+                        "Still running (%.1fs): output_lines_total=%d tail_lines=%d last_output=%.1fs_ago",
+                        elapsed,
+                        output_total,
+                        len(tail),
+                        idle,
+                    )
+                    last_heartbeat = now
             t.join(timeout=5)
             rc = proc.wait()
             if rc != 0:
@@ -617,8 +905,8 @@ def read_best_sample_rows(path: Path, limit_docs: int) -> list[dict[str, Any]]:
 
 def _extract_triplet(sample_row: dict[str, Any]) -> tuple[str, str, str, str]:
     doc = sample_row.get("doc", {}) if isinstance(sample_row.get("doc", {}), dict) else {}
-    question = str(doc.get("question", sample_row.get("prompt", "")))
-    gold = str(sample_row.get("target", doc.get("answer", "")))
+    question = str(doc.get(QUESTION_FIELD, sample_row.get("prompt", "")))
+    gold = str(sample_row.get("target", doc.get(ANSWER_FIELD, "")))
 
     raw_pred = ""
     resps = sample_row.get("resps")
@@ -640,44 +928,11 @@ def _extract_triplet(sample_row: dict[str, Any]) -> tuple[str, str, str, str]:
 
 
 def _extract_priority_answer(text: str) -> str:
-    if not text:
-        return ""
-    marker = re.search(r"(?is)the answer is\s*(-?[0-9]+(?:\.[0-9]+)?(?:,[0-9]{3})*)", text)
-    if marker:
-        return marker.group(1).strip()
-    hash_marker = re.search(r"####\s*(-?[0-9]+(?:\.[0-9]+)?(?:,[0-9]{3})*)", text)
-    if hash_marker:
-        return hash_marker.group(1).strip()
-    nums = re.findall(r"-?[0-9]+(?:\.[0-9]+)?", text.replace(",", ""))
-    return nums[-1] if nums else ""
-
-
-def _norm_text(x: str) -> str:
-    preferred = _extract_priority_answer(x)
-    s = preferred if preferred else x.strip().lower()
-    m = re.search(r"####\s*([^\n\r]+)", s)
-    if m:
-        s = m.group(1).strip()
-    s = s.replace(",", "").replace("$", "")
-    s = re.sub(r"\s+", " ", s)
-    return s.strip()
-
-
-def _extract_num(x: str) -> str | None:
-    nums = re.findall(r"-?[0-9]+(?:\.[0-9]+)?", x)
-    return nums[-1] if nums else None
+    return extract_priority_answer(text)
 
 
 def _matches(pred: str, gold: str) -> bool:
-    p = _norm_text(pred)
-    g = _norm_text(gold)
-    if not g:
-        return False
-    if p == g:
-        return True
-    pn = _extract_num(p)
-    gn = _extract_num(g)
-    return pn is not None and gn is not None and pn == gn
+    return answers_match(pred, gold)
 
 
 def build_sample_comparison(
@@ -696,7 +951,7 @@ def build_sample_comparison(
             "both_wrong": 0,
             "teacher_accuracy": None,
             "student_accuracy": None,
-            "examples": [],
+            EXAMPLES_KEY: [],
         }
 
     t_rows = read_best_sample_rows(teacher_samples, limit_docs=limit)
@@ -738,15 +993,15 @@ def build_sample_comparison(
         examples.append(
             {
                 "idx": i,
-                "question": question,
-                "gold": gold,
-                "teacher_pred": tp_extracted,
-                "student_pred": sp_extracted,
-                "teacher_raw": tp_raw,
-                "student_raw": sp_raw,
-                "teacher_ok": t_ok,
-                "student_ok": s_ok,
-                "winner": winner,
+                QUESTION_FIELD: question,
+                GOLD_FIELD: gold,
+                TEACHER_PRED_FIELD: tp_extracted,
+                STUDENT_PRED_FIELD: sp_extracted,
+                TEACHER_RAW_FIELD: tp_raw,
+                STUDENT_RAW_FIELD: sp_raw,
+                TEACHER_OK_FIELD: t_ok,
+                STUDENT_OK_FIELD: s_ok,
+                WINNER_FIELD: winner,
             }
         )
 
@@ -760,7 +1015,7 @@ def build_sample_comparison(
         "both_wrong": both_wrong,
         "teacher_accuracy": ((teacher_wins + both_correct) / n) if n > 0 else None,
         "student_accuracy": ((student_wins + both_correct) / n) if n > 0 else None,
-        "examples": examples,
+        EXAMPLES_KEY: examples,
     }
 
 
@@ -768,23 +1023,25 @@ def write_sample_columns_jsonl(path: Path, sample_cmp: dict[str, Any]) -> None:
     """
     Write a flattened, analysis-friendly samples table with stable columns.
     """
-    rows = sample_cmp.get("examples", [])
+    rows = sample_cmp.get(EXAMPLES_KEY, [])
     if not isinstance(rows, list):
         rows = []
-    with path.open("w", encoding="utf-8") as f:
-        for r in rows:
-            row = {
-                "question": str(r.get("question", "")),
-                "gold_answer": str(r.get("gold", "")),
-                "teacher_extracted": str(r.get("teacher_pred", "")),
-                "teacher_raw_prediction": str(r.get("teacher_raw", "")),
-                "student": str(r.get("student_pred", "")),
-                "student_extracted": str(r.get("student_pred", "")),
-                "student_raw_prediction": str(r.get("student_raw", "")),
-                "teacher_accuracy": 1 if bool(r.get("teacher_ok", False)) else 0,
-                "student_accuracy": 1 if bool(r.get("student_ok", False)) else 0,
+    flat_rows = []
+    for r in rows:
+        flat_rows.append(
+            {
+                QUESTION_FIELD: str(r.get(QUESTION_FIELD, "")),
+                GOLD_ANSWER_FIELD: str(r.get(GOLD_FIELD, "")),
+                TEACHER_EXTRACTED_FIELD: str(r.get(TEACHER_PRED_FIELD, "")),
+                TEACHER_RAW_PREDICTION_FIELD: str(r.get(TEACHER_RAW_FIELD, "")),
+                STUDENT_EXTRACTED_FIELD: str(r.get(STUDENT_PRED_FIELD, "")),
+                STUDENT_RAW_PREDICTION_FIELD: str(r.get(STUDENT_RAW_FIELD, "")),
+                TEACHER_MATCH_FIELD: 1 if bool(r.get(TEACHER_OK_FIELD, False)) else 0,
+                STUDENT_MATCH_FIELD: 1 if bool(r.get(STUDENT_OK_FIELD, False)) else 0,
+                WINNER_LABEL_FIELD: str(r.get(WINNER_FIELD, "")),
             }
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        )
+    write_jsonl_rows(path, flat_rows)
 
 
 def extract_score(result_json: Path, task_name: str) -> tuple[float | None, str | None]:
@@ -831,6 +1088,27 @@ def _path_from_summary(summary: dict[str, Any], key: str, role: str) -> Path | N
         return p
     LOGGER.warning("Reuse-%s path missing for key=%s: %s", role, key, p)
     return None
+
+
+def _count_jsonl_rows(path: Path) -> int:
+    count = 0
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+
+
+def _reuse_dataset_jsonl(summary: dict[str, Any], out_jsonl: Path) -> tuple[int, str]:
+    raw = summary.get("dataset_jsonl")
+    if not isinstance(raw, str) or not raw.strip():
+        raise RuntimeError("Reuse-dataset comparison is missing dataset_jsonl.")
+    src = Path(raw)
+    if not src.exists():
+        raise FileNotFoundError(f"Reuse-dataset JSONL not found: {src}")
+    out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, out_jsonl)
+    return _count_jsonl_rows(out_jsonl), str(src)
 
 
 def update_leaderboard(root_dir: Path, summary: dict[str, Any]) -> None:
@@ -1018,12 +1296,30 @@ def main() -> None:
         raise ValueError("--resume-student-only cannot be combined with --reuse-student-comparison-json.")
     if args.resume_student_only and args.reuse_teacher_comparison_json:
         raise ValueError("--resume-student-only cannot be combined with --reuse-teacher-comparison-json.")
+    if args.resume_student_only and args.reuse_dataset_jsonl_from_comparison:
+        raise ValueError("--resume-student-only cannot be combined with --reuse-dataset-jsonl-from-comparison.")
     if args.fast_mode:
         if int(args.render_html) != 0:
             LOGGER.info("Fast mode enabled: forcing --render-html=0")
         args.render_html = 0
     reused_teacher_summary = _load_reuse_summary(args.reuse_teacher_comparison_json, "teacher")
     reused_student_summary = _load_reuse_summary(args.reuse_student_comparison_json, "student")
+    reused_dataset_summary = _load_reuse_summary(args.reuse_dataset_jsonl_from_comparison, "dataset")
+    limit_cfg = resolve_limit_config(
+        args.limit,
+        allow_env_limit=bool(args.allow_env_limit),
+    )
+    if limit_cfg.get("ignored_env_limit"):
+        LOGGER.warning(
+            "Ignoring inherited env limit=%s because --allow-env-limit was not set.",
+            limit_cfg.get("ignored_env_limit"),
+        )
+    log_state(
+        "eval_limit_status",
+        limit_active=int(bool(limit_cfg.get("active"))),
+        limit_value=limit_cfg.get("value") or "none",
+        limit_source=limit_cfg.get("source") or "none",
+    )
     log_state("eval_run_start", stage=args.stage, experiment=args.experiment, split=args.split)
     ensure_lm_eval_installed()
     base_root = Path("newoutput") / "lm_eval"
@@ -1049,20 +1345,65 @@ def main() -> None:
     task_name = f"gsm8k_local_{task_slug}"
     data_jsonl = out_dir / f"{task_name}_{args.split}.jsonl"
     dataset_arrow_str: str
-    log_state("dataset_prepare_start", dataset_path=args.dataset_path, split=args.split)
-    try:
-        split_arrow = resolve_split_arrow(args.dataset_path, args.split)
-        n_rows = to_jsonl_from_arrow(split_arrow, data_jsonl, args.max_samples)
-        dataset_arrow_str = str(split_arrow)
-        log_state("dataset_prepare_end", source="arrow", rows=n_rows, jsonl=str(data_jsonl))
-    except FileNotFoundError:
-        LOGGER.info(
-            "Dataset path not found/unusable: %s. Falling back to Hugging Face dataset openai/gsm8k (main).",
-            args.dataset_path,
+    log_state(
+        "dataset_prepare_start",
+        dataset_path=args.dataset_path,
+        dataset_jsonl=args.dataset_jsonl or "none",
+        split=args.split,
+    )
+    if reused_dataset_summary is not None:
+        n_rows, reused_dataset_jsonl = _reuse_dataset_jsonl(reused_dataset_summary, data_jsonl)
+        dataset_arrow_str = str(reused_dataset_summary.get("dataset_arrow") or f"reused-jsonl:{reused_dataset_jsonl}")
+        log_state(
+            "dataset_prepare_end",
+            source="reused-comparison-jsonl",
+            rows=n_rows,
+            jsonl=str(data_jsonl),
+            reused_from=str(args.reuse_dataset_jsonl_from_comparison),
         )
-        n_rows = to_jsonl_from_hf(args.split, data_jsonl, args.max_samples)
-        dataset_arrow_str = "hf://openai/gsm8k/main"
-        log_state("dataset_prepare_end", source="hf", rows=n_rows, jsonl=str(data_jsonl))
+    elif args.dataset_jsonl:
+        src_jsonl = Path(str(args.dataset_jsonl))
+        if not src_jsonl.exists():
+            raise FileNotFoundError(f"--dataset-jsonl file not found: {src_jsonl}")
+        n_rows = copy_jsonl_dataset(src_jsonl, data_jsonl, args.max_samples)
+        dataset_arrow_str = f"jsonl://{src_jsonl}"
+        log_state("dataset_prepare_end", source="jsonl", rows=n_rows, jsonl=str(data_jsonl))
+    else:
+        try:
+            split_arrow = resolve_split_arrow(args.dataset_path, args.split)
+            n_rows = to_jsonl_from_arrow(split_arrow, data_jsonl, args.max_samples)
+            dataset_arrow_str = str(split_arrow)
+            log_state("dataset_prepare_end", source="arrow", rows=n_rows, jsonl=str(data_jsonl))
+        except FileNotFoundError:
+            LOGGER.info(
+                "Dataset path not found/unusable: %s. Falling back to Hugging Face dataset openai/gsm8k (main).",
+                args.dataset_path,
+            )
+            n_rows = to_jsonl_from_hf(args.split, data_jsonl, args.max_samples)
+            dataset_arrow_str = "hf://openai/gsm8k/main"
+            log_state("dataset_prepare_end", source="hf", rows=n_rows, jsonl=str(data_jsonl))
+
+    overlap_report_path = out_dir / "overlap_report.json"
+    overlap_refs: list[tuple[str, Path]] = []
+    for raw_ref in args.overlap_reference:
+        name, path = parse_named_path(raw_ref)
+        overlap_refs.append((name, path))
+    overlap_report: dict[str, Any] | None = None
+    if overlap_refs:
+        eval_rows = read_sample_rows(data_jsonl, limit=None)
+        overlap_report = evaluate_overlap_guardrails(
+            eval_rows=eval_rows,
+            references=overlap_refs,
+            out_path=overlap_report_path,
+            threshold=float(args.overlap_threshold),
+            allow_overlap=bool(args.allow_overlap),
+        )
+        log_state(
+            "overlap_check_done",
+            report=str(overlap_report_path),
+            violations=len(overlap_report.get("violations", [])),
+            max_overlap_pct=f"{float(overlap_report.get('max_overlap_pct', 0.0)):.6f}",
+        )
 
     effective_num_fewshot = min(int(args.num_fewshot), max(0, int(n_rows) - 1))
     if effective_num_fewshot != int(args.num_fewshot):
@@ -1116,8 +1457,8 @@ def main() -> None:
         "--gen_kwargs",
         f"do_sample=False,temperature=0.0,max_gen_toks={int(args.gen_max_toks)}",
     ]
-    if args.limit:
-        common.extend(["--limit", str(args.limit)])
+    if bool(limit_cfg.get("active")) and limit_cfg.get("value") is not None:
+        common.extend(["--limit", str(limit_cfg["value"])])
 
     teacher_out = out_dir / "teacher"
     student_out = out_dir / "student"
@@ -1178,7 +1519,7 @@ def main() -> None:
         teacher_eval_started = time.perf_counter()
         log_state("teacher_eval_start", output=str(teacher_out))
         try:
-            run_cmd(teacher_cmd, Path.cwd(), retries=max(0, int(args.retry_count)))
+            run_cmd(teacher_cmd, Path.cwd(), retries=max(0, int(args.retry_count)), echo_subprocess=bool(args.echo_subprocess))
         except subprocess.CalledProcessError:
             fallback_gen_toks = max(16, int(args.teacher_fallback_max_gen_toks))
             fallback_cmd = _replace_flag_value(teacher_cmd, "--device", str(args.teacher_fallback_device))
@@ -1200,7 +1541,7 @@ def main() -> None:
                 fallback_gen_toks,
             )
             try:
-                run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env)
+                run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env, echo_subprocess=bool(args.echo_subprocess))
             except subprocess.CalledProcessError:
                 if int(args.gpu_optimize_6gb) != 1 or not str(args.teacher_fallback_device).startswith("cuda"):
                     raise
@@ -1212,7 +1553,7 @@ def main() -> None:
                     ],
                 )
                 LOGGER.warning("Teacher CUDA retry still failed. Retrying with CUDA+CPU offload profile.")
-                run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env)
+                run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env, echo_subprocess=bool(args.echo_subprocess))
         log_state("teacher_eval_end", output=str(teacher_out), elapsed_s=f"{(time.perf_counter() - teacher_eval_started):.2f}")
 
     if reused_student_summary is not None:
@@ -1221,7 +1562,7 @@ def main() -> None:
         student_eval_started = time.perf_counter()
         log_state("student_eval_start", output=str(student_out))
         try:
-            run_cmd(student_cmd, Path.cwd(), retries=max(0, int(args.retry_count)))
+            run_cmd(student_cmd, Path.cwd(), retries=max(0, int(args.retry_count)), echo_subprocess=bool(args.echo_subprocess))
         except subprocess.CalledProcessError:
             fallback_gen_toks = max(16, int(args.student_fallback_max_gen_toks))
             fallback_cmd = _replace_flag_value(student_cmd, "--device", str(args.student_fallback_device))
@@ -1243,7 +1584,7 @@ def main() -> None:
                 fallback_gen_toks,
             )
             try:
-                run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env)
+                run_cmd(fallback_cmd, Path.cwd(), retries=0, env=fallback_env, echo_subprocess=bool(args.echo_subprocess))
             except subprocess.CalledProcessError:
                 if int(args.gpu_optimize_6gb) != 1 or not str(args.student_fallback_device).startswith("cuda"):
                     raise
@@ -1256,7 +1597,7 @@ def main() -> None:
                     ],
                 )
                 LOGGER.warning("Student CUDA retry still failed. Retrying with CUDA+CPU offload profile.")
-                run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env)
+                run_cmd(offload_cmd, Path.cwd(), retries=0, env=rtx_4050_env, echo_subprocess=bool(args.echo_subprocess))
         log_state("student_eval_end", output=str(student_out), elapsed_s=f"{(time.perf_counter() - student_eval_started):.2f}")
 
     log_state(
@@ -1304,10 +1645,36 @@ def main() -> None:
         student_samples,
         limit=int(args.sample_comparison_limit),
     )
+    examples_rows = sample_cmp.get(EXAMPLES_KEY, [])
+    if not isinstance(examples_rows, list):
+        examples_rows = []
+    bucket_metrics = compute_bucket_metrics(examples_rows)
+    teacher_extract_fail_count = sum(
+        1 for r in examples_rows if not str(r.get(TEACHER_PRED_FIELD, "") or "").strip()
+    )
+    student_extract_fail_count = sum(
+        1 for r in examples_rows if not str(r.get(STUDENT_PRED_FIELD, "") or "").strip()
+    )
+    loaded_rows = int(sample_cmp.get("loaded_rows", 0) or 0)
+    expected_rows = int(args.expected_rows) if int(args.expected_rows) > 0 else int(n_rows)
+    partial_eval = loaded_rows < expected_rows
+    likely_source = infer_partial_eval_source(
+        limit_cfg=limit_cfg,
+        sample_comparison_limit=int(args.sample_comparison_limit),
+        reused_teacher=bool(reused_teacher_summary is not None),
+        reused_student=bool(reused_student_summary is not None),
+    )
+    integrity = build_eval_integrity_status(
+        expected_rows=expected_rows,
+        loaded_rows=loaded_rows,
+        allow_partial_eval=bool(args.allow_partial_eval),
+        likely_source=likely_source,
+        limit_cfg=limit_cfg,
+    )
     log_state("sample_comparison_built", loaded_rows=sample_cmp.get("loaded_rows", 0))
     # Canonical score protocol: marker-priority extraction from raw generations.
     # Use it as the leaderboard metric only when comparison loaded the full dataset.
-    use_local_protocol = int(sample_cmp.get("loaded_rows", 0)) == int(n_rows) and int(n_rows) > 0
+    use_local_protocol = loaded_rows == expected_rows and expected_rows > 0
     if use_local_protocol:
         t_score = sample_cmp.get("teacher_accuracy")
         s_score = sample_cmp.get("student_accuracy")
@@ -1351,6 +1718,7 @@ def main() -> None:
         "dataset_arrow": dataset_arrow_str,
         "dataset_jsonl": str(data_jsonl),
         "num_rows": n_rows,
+        "expected_rows": expected_rows,
         "teacher_model": teacher_ref,
         "student_model": student_ref,
         "teacher_model_is_local_path": teacher_is_local,
@@ -1359,12 +1727,24 @@ def main() -> None:
         "fast_mode": bool(args.fast_mode),
         "teacher_reused_from_comparison_json": str(args.reuse_teacher_comparison_json) if reused_teacher_summary is not None else None,
         "student_reused_from_comparison_json": str(args.reuse_student_comparison_json) if reused_student_summary is not None else None,
+        "dataset_reused_from_comparison_json": str(args.reuse_dataset_jsonl_from_comparison) if reused_dataset_summary is not None else None,
         "teacher_results_json": str(teacher_res) if teacher_res else None,
         "student_results_json": str(student_res) if student_res else None,
         "teacher_samples_jsonl": str(teacher_samples) if teacher_samples else None,
         "student_samples_jsonl": str(student_samples) if student_samples else None,
         "teacher_metric_key": t_metric_key,
         "student_metric_key": s_metric_key,
+        "limit_active": bool(limit_cfg.get("active")),
+        "limit_value": limit_cfg.get("value"),
+        "limit_source": limit_cfg.get("source"),
+        "overlap_threshold": float(args.overlap_threshold),
+        "allow_overlap": bool(args.allow_overlap),
+        "overlap_report_json": str(overlap_report_path) if overlap_refs else None,
+        "overlap_violations": (
+            len(overlap_report.get("violations", []))
+            if isinstance(overlap_report, dict)
+            else 0
+        ),
         "teacher_lm_eval_exact_match": lm_t_score,
         "student_lm_eval_exact_match": lm_s_score,
         "teacher_lm_eval_metric_key": lm_t_metric_key,
@@ -1376,9 +1756,43 @@ def main() -> None:
         "delta_teacher_minus_student": (t_score - s_score) if (t_score is not None and s_score is not None) else None,
         "teacher_output": str(teacher_out),
         "student_output": str(student_out),
-        "sample_comparison": sample_cmp,
+        "eval_integrity": integrity,
+        "invalid_run": bool(partial_eval),
+        "bucket_metrics": bucket_metrics,
+        "extraction_failures": {
+            "teacher_extract_fail_count": teacher_extract_fail_count,
+            "student_extract_fail_count": student_extract_fail_count,
+            "teacher_extract_fail_rate": (
+                (teacher_extract_fail_count / loaded_rows) if loaded_rows > 0 else None
+            ),
+            "student_extract_fail_rate": (
+                (student_extract_fail_count / loaded_rows) if loaded_rows > 0 else None
+            ),
+        },
+        SAMPLE_COMPARISON_KEY: sample_cmp,
         "sample_columns_jsonl": str(sample_columns_jsonl),
     }
+    if partial_eval and not bool(args.allow_partial_eval):
+        invalid_msg = build_partial_eval_error_message(integrity)
+        invalid_payload = {
+            "created_at_utc": summary.get("created_at_utc"),
+            "eval_name": eval_name_final,
+            "invalid_run": True,
+            "error": invalid_msg,
+            "eval_integrity": integrity,
+            "limit_status": {
+                "active": bool(limit_cfg.get("active")),
+                "value": limit_cfg.get("value"),
+                "source": limit_cfg.get("source"),
+            },
+            "dataset_jsonl": str(data_jsonl),
+            "overlap_report_json": str(overlap_report_path) if overlap_refs else None,
+        }
+        invalid_path = out_dir / "invalid_eval.json"
+        invalid_path.write_text(json.dumps(invalid_payload, indent=2), encoding="utf-8")
+        LOGGER.error(invalid_msg)
+        LOGGER.error("Invalid eval artifact written: %s", invalid_path)
+        raise RuntimeError(invalid_msg)
     (out_dir / "comparison.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     (out_dir / "eval_metadata.json").write_text(
         json.dumps(
@@ -1396,9 +1810,12 @@ def main() -> None:
         encoding="utf-8",
     )
     log_state("summary_written", comparison_json=str(out_dir / "comparison.json"), eval_metadata=str(out_dir / "eval_metadata.json"))
-    update_leaderboard(base_root, summary)
-    update_tracking_registry(base_root, summary)
-    log_state("tracking_updated", leaderboard=str(base_root / "leaderboard.jsonl"), registry=str(base_root / "eval_tracking_registry.jsonl"))
+    if bool(summary.get("invalid_run")):
+        LOGGER.warning("Skipping leaderboard/tracking update for invalid partial run: %s", eval_name_final)
+    else:
+        update_leaderboard(base_root, summary)
+        update_tracking_registry(base_root, summary)
+        log_state("tracking_updated", leaderboard=str(base_root / "leaderboard.jsonl"), registry=str(base_root / "eval_tracking_registry.jsonl"))
 
     lines = [
         "# Custom lm-eval GSM8K Report",
@@ -1413,8 +1830,15 @@ def main() -> None:
         f"- Dataset jsonl: `{data_jsonl}`",
         f"- Rows: `{n_rows}`",
         f"- Fast mode: `{bool(args.fast_mode)}`",
+        f"- Limit active: `{bool(limit_cfg.get('active'))}` (source: `{limit_cfg.get('source')}`, value: `{limit_cfg.get('value')}`)",
         f"- Teacher reused: `{args.reuse_teacher_comparison_json}`",
         f"- Student reused: `{args.reuse_student_comparison_json}`",
+        f"- Dataset reused: `{args.reuse_dataset_jsonl_from_comparison}`",
+        f"- Overlap report: `{overlap_report_path if overlap_refs else 'none'}`",
+        f"- Overlap violations: `{len(overlap_report.get('violations', [])) if isinstance(overlap_report, dict) else 0}`",
+        f"- Invalid run: `{bool(summary.get('invalid_run'))}`",
+        f"- Integrity expected rows: `{expected_rows}`",
+        f"- Integrity loaded rows: `{loaded_rows}`",
         "",
         "## Scores",
         "",
@@ -1433,6 +1857,16 @@ def main() -> None:
         f"- Both wrong: `{sample_cmp['both_wrong']}`",
         f"- Teacher accuracy (loaded rows): `{sample_cmp['teacher_accuracy']}`",
         f"- Student accuracy (loaded rows): `{sample_cmp['student_accuracy']}`",
+        "",
+        "## Bucket Metrics",
+        "",
+        f"- {BUCKET_TEACHER_CORRECT_STUDENT_WRONG}: `{bucket_metrics.get('bucket_counts', {}).get(BUCKET_TEACHER_CORRECT_STUDENT_WRONG, 0)}`",
+        f"- {BUCKET_BOTH_CORRECT}: `{bucket_metrics.get('bucket_counts', {}).get(BUCKET_BOTH_CORRECT, 0)}`",
+        f"- {BUCKET_BOTH_WRONG}: `{bucket_metrics.get('bucket_counts', {}).get(BUCKET_BOTH_WRONG, 0)}`",
+        f"- {BUCKET_TEACHER_WRONG_STUDENT_CORRECT}: `{bucket_metrics.get('bucket_counts', {}).get(BUCKET_TEACHER_WRONG_STUDENT_CORRECT, 0)}`",
+        f"- Recovery count (teacher correct / student wrong): `{bucket_metrics.get('recovery_count_teacher_correct_student_wrong')}`",
+        f"- Damage count (both correct): `{bucket_metrics.get('damage_count_both_correct')}`",
+        f"- Damage count (teacher wrong / student correct): `{bucket_metrics.get('damage_count_teacher_wrong_student_correct')}`",
         "",
         "## Outputs",
         "",

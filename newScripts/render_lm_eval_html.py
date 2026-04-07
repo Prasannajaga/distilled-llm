@@ -7,6 +7,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from newScripts.common import (
+    EXAMPLES_KEY,
+    GOLD_ANSWER_FIELD,
+    GOLD_FIELD,
+    QUESTION_FIELD,
+    SAMPLE_COMPARISON_KEY,
+    STUDENT_EXTRACTED_FIELD,
+    STUDENT_MATCH_FIELD,
+    STUDENT_PRED_FIELD,
+    STUDENT_OK_FIELD,
+    TEACHER_EXTRACTED_FIELD,
+    TEACHER_MATCH_FIELD,
+    TEACHER_PRED_FIELD,
+    TEACHER_OK_FIELD,
+)
+
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -90,7 +106,7 @@ def render_html(
     row_limit: int,
 ) -> str:
     current_eval = str(current.get("eval_name", run_dir.name))
-    examples = current.get("sample_comparison", {}).get("examples", [])
+    examples = current.get(SAMPLE_COMPARISON_KEY, {}).get(EXAMPLES_KEY, [])
     if not isinstance(examples, list):
         examples = []
     if row_limit > 0:
@@ -117,12 +133,12 @@ def render_html(
             _row_cells(
                 [
                     html.escape(str(r.get("idx", ""))),
-                    html.escape(str(r.get("question", ""))),
-                    html.escape(str(r.get("gold", ""))),
-                    html.escape(str(r.get("teacher_pred", ""))),
-                    html.escape(str(r.get("student_pred", ""))),
-                    "1" if bool(r.get("teacher_ok", False)) else "0",
-                    "1" if bool(r.get("student_ok", False)) else "0",
+                    html.escape(str(r.get(QUESTION_FIELD, ""))),
+                    html.escape(str(r.get(GOLD_FIELD, ""))),
+                    html.escape(str(r.get(TEACHER_PRED_FIELD, ""))),
+                    html.escape(str(r.get(STUDENT_PRED_FIELD, ""))),
+                    "1" if bool(r.get(TEACHER_OK_FIELD, False)) else "0",
+                    "1" if bool(r.get(STUDENT_OK_FIELD, False)) else "0",
                 ]
             )
         )
@@ -133,12 +149,12 @@ def render_html(
         latest_sample_rows.append(
             _row_cells(
                 [
-                    html.escape(str(r.get("question", ""))),
-                    html.escape(str(r.get("gold_answer", ""))),
-                    html.escape(str(r.get("teacher_extracted", ""))),
-                    html.escape(str(r.get("student_extracted", ""))),
-                    html.escape(str(r.get("teacher_accuracy", ""))),
-                    html.escape(str(r.get("student_accuracy", ""))),
+                    html.escape(str(r.get(QUESTION_FIELD, ""))),
+                    html.escape(str(r.get(GOLD_ANSWER_FIELD, ""))),
+                    html.escape(str(r.get(TEACHER_EXTRACTED_FIELD, ""))),
+                    html.escape(str(r.get(STUDENT_EXTRACTED_FIELD, ""))),
+                    html.escape(str(r.get(TEACHER_MATCH_FIELD, ""))),
+                    html.escape(str(r.get(STUDENT_MATCH_FIELD, ""))),
                 ]
             )
         )
