@@ -1,1 +1,0 @@
-{"sample_id": 1, "category": "addition", "question": "Compute 10 + 7.", "gold_answer": "17", "prediction": "10 + 7.5 = 10 + 7.", "raw_generation": "10 + 7.5 = 10 + 7.", "normalized_exact_match": false, "numeric_within_tolerance": false, "abs_numeric_error": 10.0, "generated_tokens": 16, "latency_ms": 797.4625730000184, "render_mode_used": "plain"}
